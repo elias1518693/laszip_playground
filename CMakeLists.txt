@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 
 set(TARGET_NAME laszip_playground)
-project(${TARGET_NAME} LANGUAGES CXX CUDA)  # <-- enable CUDA language
+project(${TARGET_NAME} LANGUAGES CXX CUDA)  # CUDA enabled
 
 set(CMAKE_CXX_STANDARD 23)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
@@ -11,7 +11,7 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 # --------------------------------------------------------
 file(GLOB PROJECT_SOURCES CONFIGURE_DEPENDS 
     src/*.[ch]pp
-    src/*.cu      # <-- include CUDA files
+    src/*.cu
 )
 
 # --------------------------------------------------------
@@ -37,21 +37,19 @@ target_include_directories(${TARGET_NAME} PRIVATE
 # --------------------------------------------------------
 # CUDA configuration
 # --------------------------------------------------------
-# Optional: choose GPU architectures to compile for
-set(CMAKE_CUDA_ARCHITECTURES 75 86 89 90)  # adapt to your GPU(s)
-# You can check your compute capability here: https://developer.nvidia.com/cuda-gpus
+# Choose GPU architectures (adjust for your machine)
+set(CMAKE_CUDA_ARCHITECTURES 75 86 89 90)
 
-# Treat all CUDA warnings as errors (optional)
-# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Werror all-warnings")
-
-# Enable separable compilation (if your .cu files use device functions across TUs)
+# Enable separable compilation (for multi-file CUDA builds)
 set_target_properties(${TARGET_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# Treat warnings as errors (optional)
+# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Werror all-warnings")
 
 # --------------------------------------------------------
 # Windows-specific options
 # --------------------------------------------------------
 if (WIN32)
-    # set Visual Studio working directory
     set_property(TARGET ${TARGET_NAME} PROPERTY 
         VS_DEBUGGER_WORKING_DIRECTORY "$(SolutionDir).."
     )
