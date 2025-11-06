@@ -67,17 +67,32 @@ __device__ static inline void RansEncPutSymbol(uint32_t* r, uint8_t** pptr, Rans
 
 
 __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
-    size_t buf_stride, int nthreads, int symbols_per_thread)
+    size_t buf_stride, size_t block_size, int symbols_per_thread, size_t total_symbols)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // --- Warp-Parallel Coalesced Indexing ---
+    int tid_in_block = threadIdx.x;
+    int total_threads_in_block = blockDim.x;
+    size_t global_tid = (size_t)blockIdx.x * total_threads_in_block + tid_in_block;
+    size_t block_start_addr = (size_t)blockIdx.x * block_size;
+    // --- End Indexing ---
 
-    uint8_t* mybuf = outbuf + tid * buf_stride;
+    uint8_t* mybuf = outbuf + global_tid * buf_stride;
     uint8_t* ptr = mybuf + buf_stride;
     uint32_t s = RANS_BYTE_L;
-    const uint8_t* seq = in_data + tid * symbols_per_thread;
+    const uint8_t* seq = in_data; // Use base pointer
 
     for (int i = symbols_per_thread - 1; i >= 0; --i) {
-        uint8_t sym = seq[i];
+        // --- Coalesced memory access ---
+        // 'i' is the stripe index, 'tid_in_block' is the offset in the stripe
+        size_t addr = block_start_addr + (size_t)i * total_threads_in_block + tid_in_block;
+
+        // Handle padding on the last block
+        if (addr >= total_symbols) {
+            continue;
+        }
+        uint8_t sym = seq[addr];
+        // --- End Coalesced Access ---
+
         uint32_t start = d_cum[sym];
         uint32_t freq = d_freq[sym];
 
@@ -120,7 +135,11 @@ __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
     // --- End Inlined RansEncFlush ---
 
     // Store size at start of buffer
-    uint32_t bytes_used = (uint32_t)(buf_stride - (ptr - mybuf));
+    // Note: We're not copying the data anymore, just storing the size.
+    // The RansEncPutSymbol writes bytes as it goes, but it writes them
+    // *before* the 'ptr'. We must now copy the data from [ptr, mybuf + buf_stride)
+    // to the beginning of the buffer.
+    uint32_t bytes_used = (uint32_t)((mybuf + buf_stride) - ptr); // Correct bytes_used calc
     mybuf[0] = (uint8_t)(bytes_used);
     mybuf[1] = (uint8_t)(bytes_used >> 8);
     mybuf[2] = (uint8_t)(bytes_used >> 16);
@@ -136,9 +155,14 @@ __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
 
 
 __global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
-    int nthreads, int symbols_per_thread, uint8_t* out_symbols)
+    size_t block_size, int symbols_per_thread, uint8_t* out_symbols, size_t total_symbols)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // --- Warp-Parallel Coalesced Indexing ---
+    int tid_in_block = threadIdx.x;
+    int total_threads_in_block = blockDim.x;
+    size_t global_tid = (size_t)blockIdx.x * total_threads_in_block + tid_in_block;
+    size_t block_start_addr = (size_t)blockIdx.x * block_size;
+    // --- End Indexing ---
 
     // Load freq tables to shared memory
     __shared__ uint16_t s_freq[ALPHABET_SIZE];
@@ -152,10 +176,11 @@ __global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
     }
     __syncthreads();
 
-    uint8_t* ptr = inbuf + tid * buf_stride + 4;
-    uint32_t st;
+    uint8_t* ptr = inbuf + global_tid * buf_stride; // Use global_tid
 
-    // --- Inlined RansDecInit ---
+    uint32_t st; // <-- FIX: Declare the state variable
+
+    ptr += 4;
     {
         st = ptr[0] << 0;
         st |= ptr[1] << 8;
@@ -163,7 +188,6 @@ __global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
         st |= ptr[3] << 24;
         ptr += 4;
     }
-    // --- End Inlined RansDecInit ---
 
     for (int i = 0; i < symbols_per_thread; ++i) {
 
@@ -172,7 +196,16 @@ __global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
 
         // --- Inlined find_symbol ---
         uint8_t sym = d_lookup[cum_val]; // O(1) lookup
-        out_symbols[tid * symbols_per_thread + i] = sym;
+
+        // --- Coalesced memory access ---
+        size_t addr = block_start_addr + (size_t)i * total_threads_in_block + tid_in_block;
+
+        // Handle padding on the last block
+        if (addr >= total_symbols) {
+            continue;
+        }
+        out_symbols[addr] = sym;
+        // --- End Coalesced Access ---
 
         uint32_t start = s_cum[sym];
         uint32_t freq = s_freq[sym];
@@ -282,47 +315,31 @@ void SymbolStats::normalize_freqs(uint32_t target_total)
 
 int test(uint8_t* data, size_t length)
 {
-    const int nthreads = 32; // blockDim.x
-    int nblocks = 4048;      // gridDim.x
+    // --- New Warp-Parallel Configuration ---
+    const int nthreads = 256; // Threads per block (e.g., 8 warps)
+    const size_t LOG_BLOCK_SIZE = 14;
+    const size_t BLOCK_SIZE = 1 << LOG_BLOCK_SIZE; // 16384 symbols per data block
+    const int symbols_per_thread = BLOCK_SIZE / nthreads; // 16384 / 256 = 64
+    const size_t buf_stride = symbols_per_thread * 2; // 128 bytes (per thread output)
+    // --- End Configuration ---
 
-    // Calculate initial total_threads
-    int total_threads = nthreads * nblocks;
+    // Pad total_symbols to be a multiple of BLOCK_SIZE for full blocks
+    size_t total_symbols = (length + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+    int nblocks = (int)(total_symbols / BLOCK_SIZE);
 
-    // Check if length is divisible
-    if (length % total_threads != 0) {
-        printf("Error: Data length %zu is not divisible by total threads %d\n", length, total_threads);
-        // Adjust nblocks
-        nblocks = (int)(length / (nthreads * 256)); // Example: 256 symbols per thread
-        if (nblocks == 0) nblocks = 1;
-
-        printf("Adjusting nblocks to %d\n", nblocks);
-
-        // *** FIX: Recalculate total_threads with the new nblocks ***
-        total_threads = nthreads * nblocks;
-    }
-
-    // Ensure length is divisible
-    length = (length / total_threads) * total_threads;
-    if (length == 0) {
-        printf("Error: Data length too small for this thread configuration.\n");
-        return 1;
-    }
-
-    const int symbols_per_thread = (int)(length / total_threads);
-    const size_t buf_stride = symbols_per_thread; // This is small, but it's per-thread *compressed* size
-
-    // Total symbols processed by all threads
-    const size_t total_symbols = (size_t)total_threads * symbols_per_thread;
+    // Total threads based on new block grid
+    int total_threads = nblocks * nthreads;
 
     // Total buffer size for compressed data (one buffer per thread)
-    const size_t total_buf = buf_stride * total_threads;
+    const size_t total_buf = (size_t)total_threads * buf_stride;
 
     printf("Running test with %d blocks * %d threads = %d total threads.\n", nblocks, nthreads, total_threads);
-    printf("Symbols per thread: %d. Total symbols: %zu.\n", symbols_per_thread, total_symbols);
+    printf("Data Block Size: %zu symbols. Symbols per thread: %d.\n", BLOCK_SIZE, symbols_per_thread);
+    printf("Total Symbols (padded): %zu. Original length: %zu.\n", total_symbols, length);
 
     // --- Build adaptive model
     SymbolStats stats;
-    stats.count_freqs(data, total_symbols); // Use total_symbols
+    stats.count_freqs(data, length); // Use original length for stats
     stats.normalize_freqs(1 << SCALE_BITS);
 
     uint16_t host_freq[ALPHABET_SIZE];
@@ -354,9 +371,14 @@ int test(uint8_t* data, size_t length)
     uint8_t* d_buf, * d_in, * d_out;
     cudaMalloc(&d_buf, total_buf);
     cudaMemset(d_buf, 0, total_buf);
+
+    // Allocate for padded size and clear to 0
     cudaMalloc(&d_in, total_symbols);
-    cudaMemcpy(d_in, data, total_symbols, cudaMemcpyHostToDevice);
+    cudaMemset(d_in, 0, total_symbols);
+    cudaMemcpy(d_in, data, length, cudaMemcpyHostToDevice); // Copy only valid data
+
     cudaMalloc(&d_out, total_symbols);
+    cudaMemset(d_out, 0, total_symbols);
 
 
     // --- Encode timing
@@ -365,7 +387,9 @@ int test(uint8_t* data, size_t length)
     cudaEventCreate(&stop_encode);
     cudaEventRecord(start_encode);
 
-    encode_kernel << <nblocks, nthreads >> > (d_buf, d_in, buf_stride, nthreads, symbols_per_thread);
+    // --- Launch with new parallel strategy ---
+    encode_kernel << <nblocks, nthreads >> > (
+        d_buf, d_in, buf_stride, BLOCK_SIZE, symbols_per_thread, total_symbols);
 
     cudaEventRecord(stop_encode);
     cudaEventSynchronize(stop_encode);
@@ -379,7 +403,9 @@ int test(uint8_t* data, size_t length)
     cudaEventCreate(&stop_decode);
     cudaEventRecord(start_decode);
 
-    decode_kernel << <nblocks, nthreads >> > (d_buf, buf_stride, nthreads, symbols_per_thread, d_out);
+    // --- Launch with new parallel strategy ---
+    decode_kernel << <nblocks, nthreads >> > (
+        d_buf, buf_stride, BLOCK_SIZE, symbols_per_thread, d_out, total_symbols);
 
     cudaEventRecord(stop_decode);
     cudaEventSynchronize(stop_decode);
@@ -388,7 +414,7 @@ int test(uint8_t* data, size_t length)
     cudaEventElapsedTime(&decode_ms, start_decode, stop_decode);
 
     // --- Verify
-    uint8_t* h_out = (uint8_t*)malloc(total_symbols);
+    uint8_t* h_out = (uint8_t*)malloc(total_symbols); // Alloc for padded size
     if (!h_out) {
         printf("Failed to alloc h_out\n");
         return 1;
@@ -396,7 +422,7 @@ int test(uint8_t* data, size_t length)
     cudaMemcpy(h_out, d_out, total_symbols, cudaMemcpyDeviceToHost);
 
     bool ok = true;
-    for (size_t i = 0; i < total_symbols; ++i) {
+    for (size_t i = 0; i < length; ++i) { // Verify only original length
         if (h_out[i] != data[i]) {
             ok = false;
             printf("Mismatch at index %zu: expected %d, got %d\n", i, data[i], h_out[i]);
@@ -405,7 +431,7 @@ int test(uint8_t* data, size_t length)
     }
 
     // --- Compute throughput (MB/s)
-    double data_mb = static_cast<double>(total_symbols) / (1024.0 * 1024.0);
+    double data_mb = static_cast<double>(length) / (1024.0 * 1024.0); // Use original length
     double encode_throughput = data_mb / (encode_ms / 1000.0);
     double decode_throughput = data_mb / (decode_ms / 1000.0);
 
