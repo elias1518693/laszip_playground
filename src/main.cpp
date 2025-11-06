@@ -69,7 +69,7 @@ int main()
     bool first = true;
 
     uint64_t total_points = lazHeader->number_of_point_records;
-    const int pointLimit = min((int)total_points, 10000000);
+    const int pointLimit = min((int)total_points, 500000000);
 
     println("Reading {} points from '{}'...", pointLimit, file);
 
