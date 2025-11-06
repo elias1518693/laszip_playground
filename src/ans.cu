@@ -1,7 +1,13 @@
 ﻿// rans_byte_cuda.cu
 // CUDA translation of "Simple byte-aligned rANS encoder/decoder" (Fabian 'ryg' Giesen)
 // Single-file example with per-thread rANS encode/decode demo.
-// Compile: nvcc rans_byte_cuda.cu -o rans_test
+//
+// Cleaned-up version:
+// - Removed unused device functions (RansEncPut, RansDecAdvanceSymbol, etc.)
+// - Inlined single-use helper functions (RansEncFlush, RansDecInit, etc.)
+//   directly into the kernels for a more compact file.
+//
+// Compile: nvcc rans_byte_cuda_cleaned.cu -o rans_test
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,97 +23,14 @@
 #define RansAssert(x)
 #endif
 
-#define RANS_BYTE_L (1u << 23)  // lower bound of normalization interval
+#define RANS_BYTE_L (1u << 23) // lower bound of normalization interval
 
-
-#define SCALE_BITS 14                  // 4096 total probability space
+#define SCALE_BITS 11             // 4096 total probability space
 #define ALPHABET_SIZE 256
 
 __device__ __constant__ uint16_t d_freq[ALPHABET_SIZE];
 __device__ __constant__ uint32_t d_cum[ALPHABET_SIZE];
-
-
-__device__ __host__ static inline void symbol_to_range(uint8_t sym, uint32_t* start, uint32_t* freq)
-{
-    *start = d_cum[sym];
-    *freq = d_freq[sym];
-}
-
-// Renormalize encoder (internal).
-__device__ static inline uint32_t RansEncRenorm(uint32_t x, uint8_t** pptr, uint32_t freq, uint32_t scale_bits)
-{
-    uint32_t x_max = ((RANS_BYTE_L >> scale_bits) << 8) * freq;
-    if (x >= x_max) {
-        uint8_t* ptr = *pptr;
-        do {
-            *--ptr = (uint8_t)(x & 0xff);
-            x >>= 8;
-        } while (x >= x_max);
-        *pptr = ptr;
-    }
-    return x;
-}
-
-// Put symbol (generic).
-__device__ static inline void RansEncPut(uint32_t* r, uint8_t** pptr, uint32_t start, uint32_t freq, uint32_t scale_bits)
-{
-    uint32_t x = RansEncRenorm(*r, pptr, freq, scale_bits);
-    *r = ((x / freq) << scale_bits) + (x % freq) + start;
-}
-
-// Flush encoder state to stream (writes 4 bytes little-endian).
-__device__ static inline void RansEncFlush(uint32_t* r, uint8_t** pptr)
-{
-    uint32_t x = *r;
-    uint8_t* ptr = *pptr;
-
-    ptr -= 4;
-    ptr[0] = (uint8_t)(x >> 0);
-    ptr[1] = (uint8_t)(x >> 8);
-    ptr[2] = (uint8_t)(x >> 16);
-    ptr[3] = (uint8_t)(x >> 24);
-
-    *pptr = ptr;
-}
-
-// Decoder init: read 4 bytes to form initial state. Note: decoder reads forward in stream.
-__device__ static inline void RansDecInit(uint32_t* r, uint8_t** pptr)
-{
-    uint32_t x;
-    uint8_t* ptr = *pptr;
-
-    x = ptr[0] << 0;
-    x |= ptr[1] << 8;
-    x |= ptr[2] << 16;
-    x |= ptr[3] << 24;
-    ptr += 4;
-
-    *pptr = ptr;
-    *r = x;
-}
-
-// Return current cumulative frequency (low bits).
-__device__ static inline uint32_t RansDecGet(uint32_t* r, uint32_t scale_bits)
-{
-    return *r & ((1u << scale_bits) - 1);
-}
-
-// Decoder advance (pops symbol).
-__device__ static inline void RansDecAdvance(uint32_t* r, uint8_t** pptr, uint32_t start, uint32_t freq, uint32_t scale_bits)
-{
-    uint32_t mask = (1u << scale_bits) - 1;
-
-    uint32_t x = *r;
-    x = freq * (x >> scale_bits) + (x & mask) - start;
-
-    if (x < RANS_BYTE_L) {
-        uint8_t* ptr = *pptr;
-        do x = (x << 8) | *ptr++; while (x < RANS_BYTE_L);
-        *pptr = ptr;
-    }
-
-    *r = x;
-}
+__device__ __constant__ uint8_t d_lookup[1 << SCALE_BITS];
 
 // --------------------------------------------------------------------------
 // Fast encoder/decoder symbol structs and helpers (same as original).
@@ -119,31 +42,8 @@ typedef struct {
     uint16_t rcp_shift;
 } RansEncSymbol;
 
-typedef struct {
-    uint16_t start;
-    uint16_t freq;
-} RansDecSymbol;
-
-__device__ static inline void RansEncSymbolInit(RansEncSymbol* s, uint32_t start, uint32_t freq, uint32_t scale_bits)
-{   s->x_max = ((RANS_BYTE_L >> scale_bits) << 8) * freq;
-    s->cmpl_freq = (uint16_t)((1 << scale_bits) - freq);
-    if (freq < 2) {
-        s->rcp_freq = ~0u;
-        s->rcp_shift = 0;
-        s->bias = start + (1 << scale_bits) - 1;
-    }
-    else {
-        uint32_t shift = 0;
-        while (freq > (1u << shift))
-            shift++;
-
-        s->rcp_freq = (uint32_t)(((1ull << (shift + 31)) + freq - 1) / freq);
-        s->rcp_shift = shift - 1;
-        s->bias = start;
-    }
-}
-
 // Fast encode using symbol.
+// This is the core encoding function, kept from the original.
 __device__ static inline void RansEncPutSymbol(uint32_t* r, uint8_t** pptr, RansEncSymbol const* sym)
 {
     RansAssert(sym->x_max != 0);
@@ -158,38 +58,13 @@ __device__ static inline void RansEncPutSymbol(uint32_t* r, uint8_t** pptr, Rans
         } while (x >= x_max);
         *pptr = ptr;
     }
-    //x = freq * floor(x / freq) + (x % freq)
+
+    // x = freq * floor(x / freq) + (x % freq)
+    // This is the fast alternative using precomputed rcp_freq
     uint32_t q = (uint32_t)(((uint64_t)x * sym->rcp_freq) >> 32) >> sym->rcp_shift;
     *r = x + sym->bias + q * sym->cmpl_freq;
 }
 
-__device__ static inline void RansDecAdvanceSymbol(uint32_t* r, uint8_t** pptr, RansDecSymbol const* sym, uint32_t scale_bits)
-{
-    RansDecAdvance(r, pptr, sym->start, sym->freq, scale_bits);
-}
-
-__device__ static inline void RansDecAdvanceStep(uint32_t* r, uint32_t start, uint32_t freq, uint32_t scale_bits)
-{
-    uint32_t mask = (1u << scale_bits) - 1;
-    uint32_t x = *r;
-    *r = freq * (x >> scale_bits) + (x & mask) - start;
-}
-
-__device__ static inline void RansDecAdvanceSymbolStep(uint32_t* r, RansDecSymbol const* sym, uint32_t scale_bits)
-{
-    RansDecAdvanceStep(r, sym->start, sym->freq, scale_bits);
-}
-
-__device__ static inline void RansDecRenorm(uint32_t* r, uint8_t** pptr)
-{
-    uint32_t x = *r;
-    if (x < RANS_BYTE_L) {
-        uint8_t* ptr = *pptr;
-        do x = (x << 8) | *ptr++; while (x < RANS_BYTE_L);
-        *pptr = ptr;
-    }
-    *r = x;
-}
 
 __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
     size_t buf_stride, int nthreads, int symbols_per_thread)
@@ -205,31 +80,60 @@ __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
         uint8_t sym = seq[i];
         uint32_t start = d_cum[sym];
         uint32_t freq = d_freq[sym];
+
         RansEncSymbol symb;
-        RansEncSymbolInit(&symb, start, freq, SCALE_BITS);
+
+        // --- Inlined RansEncSymbolInit ---
+        {
+            symb.x_max = ((RANS_BYTE_L >> SCALE_BITS) << 8) * freq;
+            symb.cmpl_freq = (uint16_t)((1 << SCALE_BITS) - freq);
+            if (freq < 2) {
+                symb.rcp_freq = ~0u;
+                symb.rcp_shift = 0;
+                symb.bias = start + (1 << SCALE_BITS) - 1;
+            }
+            else {
+                uint32_t shift = 0;
+                while (freq > (1u << shift))
+                    shift++;
+
+                symb.rcp_freq = (uint32_t)(((1ull << (shift + 31)) + freq - 1) / freq);
+                symb.rcp_shift = shift - 1;
+                symb.bias = start;
+            }
+        }
+        // --- End Inlined RansEncSymbolInit ---
+
         RansEncPutSymbol(&s, &ptr, &symb);
     }
 
-    RansEncFlush(&s, &ptr);
-	//store size at start of buffer
+    // --- Inlined RansEncFlush ---
+    {
+        uint32_t x = s;
+        ptr -= 4;
+        ptr[0] = (uint8_t)(x >> 0);
+        ptr[1] = (uint8_t)(x >> 8);
+        ptr[2] = (uint8_t)(x >> 16);
+        ptr[3] = (uint8_t)(x >> 24);
+        // *pptr = ptr; // Not needed, ptr is local
+    }
+    // --- End Inlined RansEncFlush ---
+
+    // Store size at start of buffer
     uint32_t bytes_used = (uint32_t)(buf_stride - (ptr - mybuf));
     mybuf[0] = (uint8_t)(bytes_used);
     mybuf[1] = (uint8_t)(bytes_used >> 8);
     mybuf[2] = (uint8_t)(bytes_used >> 16);
     mybuf[3] = (uint8_t)(bytes_used >> 24);
 
+    // Copy encoded data to the start (after the 4-byte size)
     uint8_t* emitted_start = ptr;
-    uint8_t* dst = 
+    uint8_t* dst =
         mybuf + 4;
     for (uint32_t i = 0; i < bytes_used; ++i)
         dst[i] = emitted_start[i];
 }
 
-__device__ __constant__ uint8_t d_lookup[1 << SCALE_BITS];
-__device__ __forceinline__ uint8_t find_symbol(uint32_t cum)
-{
-    return d_lookup[cum];
-}
 
 __global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
     int nthreads, int symbols_per_thread, uint8_t* out_symbols)
@@ -239,32 +143,61 @@ __global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
     // Load freq tables to shared memory
     __shared__ uint16_t s_freq[ALPHABET_SIZE];
     __shared__ uint32_t s_cum[ALPHABET_SIZE];
-    for(int i = 0; i < 8; i++) {
-        int idx = threadIdx.x + i * 32;
+    for (int i = 0; i < 8; i++) {
+        int idx = threadIdx.x + i * 32; // 8 * 32 = 256
         if (idx < ALPHABET_SIZE) {
             s_freq[idx] = d_freq[idx];
             s_cum[idx] = d_cum[idx];
         }
-	}
+    }
     __syncthreads();
 
     uint8_t* ptr = inbuf + tid * buf_stride + 4;
     uint32_t st;
-    RansDecInit(&st, &ptr);
 
-//#pragma unroll
+    // --- Inlined RansDecInit ---
+    {
+        st = ptr[0] << 0;
+        st |= ptr[1] << 8;
+        st |= ptr[2] << 16;
+        st |= ptr[3] << 24;
+        ptr += 4;
+    }
+    // --- End Inlined RansDecInit ---
+
     for (int i = 0; i < symbols_per_thread; ++i) {
-        uint32_t cum_val = RansDecGet(&st, SCALE_BITS);
-        uint8_t sym = d_lookup[cum_val];    // O(1) lookup
+
+        // --- Inlined RansDecGet ---
+        uint32_t cum_val = st & ((1u << SCALE_BITS) - 1);
+
+        // --- Inlined find_symbol ---
+        uint8_t sym = d_lookup[cum_val]; // O(1) lookup
         out_symbols[tid * symbols_per_thread + i] = sym;
 
         uint32_t start = s_cum[sym];
         uint32_t freq = s_freq[sym];
-        RansDecAdvance(&st, &ptr, start, freq, SCALE_BITS);
+
+        // --- Inlined RansDecAdvance ---
+        {
+            uint32_t mask = (1u << SCALE_BITS) - 1;
+            uint32_t x = st;
+
+            x = freq * (x >> SCALE_BITS) + (x & mask) - start;
+
+            // Renormalize
+            if (x < RANS_BYTE_L) {
+                do x = (x << 8) | *ptr++; while (x < RANS_BYTE_L);
+            }
+            st = x;
+        }
+        // --- End Inlined RansDecAdvance ---
     }
 }
 
 
+// --------------------------------------------------------------------------
+// Host-side code
+// --------------------------------------------------------------------------
 
 struct SymbolStats
 {
@@ -305,13 +238,10 @@ void SymbolStats::normalize_freqs(uint32_t target_total)
 
     // if we nuked any non-0 frequency symbol to 0, we need to steal
     // the range to make the frequency nonzero from elsewhere.
-    //
-    // this is not at all optimal, i'm just doing the first thing that comes to mind.
     for (int i = 0; i < 256; i++) {
         if (freqs[i] && cum_freqs[i + 1] == cum_freqs[i]) {
             // symbol i was set to zero freq
-
-            // find best symbol to steal frequency from (try to steal from low-freq ones)
+            // find best symbol to steal frequency from
             uint32_t best_freq = ~0u;
             int best_steal = -1;
             for (int j = 0; j < 256; j++) {
@@ -352,15 +282,47 @@ void SymbolStats::normalize_freqs(uint32_t target_total)
 
 int test(uint8_t* data, size_t length)
 {
-    const int nthreads = 32;
-    int nblocks = 4048;
-    const int symbols_per_thread = length / (nthreads*nblocks);
-    const size_t buf_stride = symbols_per_thread;
-    const size_t total_buf = buf_stride * nthreads * nblocks;
+    const int nthreads = 32; // blockDim.x
+    int nblocks = 4048;      // gridDim.x
+
+    // Calculate initial total_threads
+    int total_threads = nthreads * nblocks;
+
+    // Check if length is divisible
+    if (length % total_threads != 0) {
+        printf("Error: Data length %zu is not divisible by total threads %d\n", length, total_threads);
+        // Adjust nblocks
+        nblocks = (int)(length / (nthreads * 256)); // Example: 256 symbols per thread
+        if (nblocks == 0) nblocks = 1;
+
+        printf("Adjusting nblocks to %d\n", nblocks);
+
+        // *** FIX: Recalculate total_threads with the new nblocks ***
+        total_threads = nthreads * nblocks;
+    }
+
+    // Ensure length is divisible
+    length = (length / total_threads) * total_threads;
+    if (length == 0) {
+        printf("Error: Data length too small for this thread configuration.\n");
+        return 1;
+    }
+
+    const int symbols_per_thread = (int)(length / total_threads);
+    const size_t buf_stride = symbols_per_thread; // This is small, but it's per-thread *compressed* size
+
+    // Total symbols processed by all threads
+    const size_t total_symbols = (size_t)total_threads * symbols_per_thread;
+
+    // Total buffer size for compressed data (one buffer per thread)
+    const size_t total_buf = buf_stride * total_threads;
+
+    printf("Running test with %d blocks * %d threads = %d total threads.\n", nblocks, nthreads, total_threads);
+    printf("Symbols per thread: %d. Total symbols: %zu.\n", symbols_per_thread, total_symbols);
 
     // --- Build adaptive model
     SymbolStats stats;
-    stats.count_freqs(data, length);
+    stats.count_freqs(data, total_symbols); // Use total_symbols
     stats.normalize_freqs(1 << SCALE_BITS);
 
     uint16_t host_freq[ALPHABET_SIZE];
@@ -372,23 +334,30 @@ int test(uint8_t* data, size_t length)
 
     cudaMemcpyToSymbol(d_freq, host_freq, sizeof(host_freq));
     cudaMemcpyToSymbol(d_cum, host_cum, sizeof(host_cum));
-    uint8_t h_lookup[1 << SCALE_BITS];
+
+    // Build host-side lookup table
+    uint8_t* h_lookup = (uint8_t*)malloc(sizeof(uint8_t) * (1 << SCALE_BITS));
+    if (!h_lookup) {
+        printf("Failed to alloc h_lookup\n");
+        return 1;
+    }
     for (int s = 0; s < 256; ++s) {
         for (uint32_t i = stats.cum_freqs[s]; i < stats.cum_freqs[s + 1]; ++i) {
             h_lookup[i] = (uint8_t)s;
         }
     }
 
-    cudaMemcpyToSymbol(d_lookup, h_lookup, sizeof(h_lookup));
+    cudaMemcpyToSymbol(d_lookup, h_lookup, sizeof(uint8_t) * (1 << SCALE_BITS));
+    free(h_lookup); // Free host table after copy
+
     // --- Allocate buffers
     uint8_t* d_buf, * d_in, * d_out;
     cudaMalloc(&d_buf, total_buf);
     cudaMemset(d_buf, 0, total_buf);
-    cudaMalloc(&d_in, nthreads * symbols_per_thread * nblocks);
-    cudaMemcpy(d_in, data, nthreads * symbols_per_thread * nblocks, cudaMemcpyHostToDevice);
-    cudaMalloc(&d_out, nthreads * symbols_per_thread * nblocks);
+    cudaMalloc(&d_in, total_symbols);
+    cudaMemcpy(d_in, data, total_symbols, cudaMemcpyHostToDevice);
+    cudaMalloc(&d_out, total_symbols);
 
- 
 
     // --- Encode timing
     cudaEvent_t start_encode, stop_encode;
@@ -419,20 +388,30 @@ int test(uint8_t* data, size_t length)
     cudaEventElapsedTime(&decode_ms, start_decode, stop_decode);
 
     // --- Verify
-    uint8_t* h_out = (uint8_t*)malloc(nthreads * symbols_per_thread * nblocks);
-    cudaMemcpy(h_out, d_out, nthreads * symbols_per_thread * nblocks, cudaMemcpyDeviceToHost);
+    uint8_t* h_out = (uint8_t*)malloc(total_symbols);
+    if (!h_out) {
+        printf("Failed to alloc h_out\n");
+        return 1;
+    }
+    cudaMemcpy(h_out, d_out, total_symbols, cudaMemcpyDeviceToHost);
 
     bool ok = true;
-    for (int i = 0; i < nthreads * symbols_per_thread * nblocks; ++i)
-        if (h_out[i] != data[i]) { ok = false; break; }
+    for (size_t i = 0; i < total_symbols; ++i) {
+        if (h_out[i] != data[i]) {
+            ok = false;
+            printf("Mismatch at index %zu: expected %d, got %d\n", i, data[i], h_out[i]);
+            break;
+        }
+    }
 
     // --- Compute throughput (MB/s)
-    double data_mb = static_cast<double>(length) / (1024.0 * 1024.0);
+    double data_mb = static_cast<double>(total_symbols) / (1024.0 * 1024.0);
     double encode_throughput = data_mb / (encode_ms / 1000.0);
     double decode_throughput = data_mb / (decode_ms / 1000.0);
 
     // --- Print results
     printf("\nVerification: %s\n", ok ? "PASS" : "FAIL");
+    printf("Data size: %.2f MB\n", data_mb);
     printf("Encode time: %.3f ms (%.2f MB/s)\n", encode_ms, encode_throughput);
     printf("Decode time: %.3f ms (%.2f MB/s)\n", decode_ms, decode_throughput);
 
