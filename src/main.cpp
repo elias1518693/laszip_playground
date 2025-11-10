@@ -47,6 +47,19 @@ vector<uint8_t> int32_to_bytes(const vector<int32_t>& input) {
     return output;
 }
 
+vector<vector<uint8_t>> int32_to_bytes_split(const vector<int32_t>& input) {
+    vector<vector<uint8_t>> output;
+    output.reserve(input.size() * sizeof(int32_t));
+    for (int32_t val : input) {
+        // Little-endian byte extraction (low byte first)
+        output[0].push_back(val & 0xFF);
+        output[1].push_back((val >> 8) & 0xFF);
+        output[2].push_back((val >> 16) & 0xFF);
+        output[3].push_back((val >> 24) & 0xFF);
+    }
+    return output;
+}
+
 /**
  * @brief Converts a little-endian byte vector back to a vector of int32_t.
  * @param input Vector of 8-bit unsigned integers.
@@ -386,8 +399,8 @@ int main()
     // Now, compress the *corrected* deltas
 
     if (!corrected_deltaX.empty()) {
-        std::vector<uint8_t> dataX = int32_to_bytes(corrected_deltaX);
+        std::vector<vector<uint8_t>> dataX = int32_to_bytes_split(corrected_deltaX);
         std::println("Compressing X deltas ({} bytes)...", dataX.size());
-        test(dataX.data(), dataX.size()); // Assuming test() is your compression function
+        test(dataX, dataX.size()); // Assuming test() is your compression function
     }
 }

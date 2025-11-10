@@ -300,7 +300,7 @@ void SymbolStats::normalize_freqs(uint32_t target_total)
 }
 
 
-int test(uint8_t* data, size_t length)
+int test(std::vector<std::vector<uint8_t>>& data, size_t length)
 {
     // --- New Warp-Parallel Configuration ---
     const int nthreads = 256;
@@ -326,7 +326,7 @@ int test(uint8_t* data, size_t length)
 
     // --- Build adaptive model
     SymbolStats stats;
-    stats.count_freqs(data, length); // Use original length for stats
+    stats.count_freqs(data[0].data(), length); // Use original length for stats
     stats.normalize_freqs(1 << SCALE_BITS);
 
     uint16_t host_freq[ALPHABET_SIZE];
@@ -366,7 +366,7 @@ int test(uint8_t* data, size_t length)
     // Allocate for padded size and clear to 0
     cudaMalloc(&d_in, total_symbols);
     cudaMemset(d_in, 0, total_symbols);
-    cudaMemcpy(d_in, data, length, cudaMemcpyHostToDevice); // Copy only valid data
+    cudaMemcpy(d_in, data[0].data(), length, cudaMemcpyHostToDevice); // Copy only valid data
 
     cudaMalloc(&d_out, total_symbols);
     cudaMemset(d_out, 0, total_symbols);
@@ -419,7 +419,7 @@ int test(uint8_t* data, size_t length)
 
     bool ok = true;
     for (size_t i = 0; i < length; ++i) { // Verify only original length
-        if (h_out[i] != data[i]) {
+        if (h_out[i] != data[0][i]) {
             ok = false;
             printf("Mismatch at index %zu: expected %d, got %d\n", i, data[i], h_out[i]);
             break;
