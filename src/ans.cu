@@ -16,7 +16,7 @@
 #include <ostream>
 #include <cassert>
 #include <iostream>
-
+#include <vector>
 #ifdef assert
 #define RansAssert assert
 #else
@@ -25,7 +25,7 @@
 
 #define RANS_BYTE_L (1u << 23) // lower bound of normalization interval
 
-#define SCALE_BITS 11             // 4096 total probability space
+#define SCALE_BITS 14             // 4096 total probability space
 #define ALPHABET_SIZE 256
 
 __device__ __constant__ uint16_t d_freq[ALPHABET_SIZE];
@@ -67,7 +67,7 @@ __device__ static inline void RansEncPutSymbol(uint32_t* r, uint8_t** pptr, Rans
 
 
 __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
-    size_t buf_stride, size_t block_size, int symbols_per_thread, size_t total_symbols)
+    size_t buf_stride, size_t block_size, int symbols_per_thread, size_t total_symbols, uint32_t* bytes_used)
 {
     // --- Warp-Parallel Coalesced Indexing ---
     int tid_in_block = threadIdx.x;
@@ -134,23 +134,10 @@ __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
     }
     // --- End Inlined RansEncFlush ---
 
-    // Store size at start of buffer
-    // Note: We're not copying the data anymore, just storing the size.
-    // The RansEncPutSymbol writes bytes as it goes, but it writes them
-    // *before* the 'ptr'. We must now copy the data from [ptr, mybuf + buf_stride)
-    // to the beginning of the buffer.
-    uint32_t bytes_used = (uint32_t)((mybuf + buf_stride) - ptr); // Correct bytes_used calc
-    mybuf[0] = (uint8_t)(bytes_used);
-    mybuf[1] = (uint8_t)(bytes_used >> 8);
-    mybuf[2] = (uint8_t)(bytes_used >> 16);
-    mybuf[3] = (uint8_t)(bytes_used >> 24);
 
-    // Copy encoded data to the start (after the 4-byte size)
-    uint8_t* emitted_start = ptr;
-    uint8_t* dst =
-        mybuf + 4;
-    for (uint32_t i = 0; i < bytes_used; ++i)
-        dst[i] = emitted_start[i];
+    bytes_used[global_tid] = (uint32_t)((mybuf + buf_stride) - ptr); // Correct bytes_used calc
+
+    // Copy encoded data to the start
 }
 
 
@@ -316,17 +303,17 @@ void SymbolStats::normalize_freqs(uint32_t target_total)
 int test(uint8_t* data, size_t length)
 {
     // --- New Warp-Parallel Configuration ---
-    const int nthreads = 256; // Threads per block (e.g., 8 warps)
-    const size_t LOG_BLOCK_SIZE = 14;
-    const size_t BLOCK_SIZE = 1 << LOG_BLOCK_SIZE; // 16384 symbols per data block
-    const int symbols_per_thread = BLOCK_SIZE / nthreads; // 16384 / 256 = 64
-    const size_t buf_stride = symbols_per_thread * 2; // 128 bytes (per thread output)
+    const int nthreads = 256;
+    const size_t LOG_BLOCK_SIZE = 20;
+    const size_t BLOCK_SIZE = 1 << LOG_BLOCK_SIZE;
+    const int symbols_per_thread = BLOCK_SIZE / nthreads; 
+    const size_t buf_stride = symbols_per_thread * 8; 
     // --- End Configuration ---
 
     // Pad total_symbols to be a multiple of BLOCK_SIZE for full blocks
     size_t total_symbols = (length + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
     int nblocks = (int)(total_symbols / BLOCK_SIZE);
-
+    std::vector<uint32_t> bytes_used(nthreads * nblocks);
     // Total threads based on new block grid
     int total_threads = nblocks * nthreads;
 
@@ -369,8 +356,12 @@ int test(uint8_t* data, size_t length)
 
     // --- Allocate buffers
     uint8_t* d_buf, * d_in, * d_out;
+	uint32_t* d_bytes_used;
     cudaMalloc(&d_buf, total_buf);
     cudaMemset(d_buf, 0, total_buf);
+
+    cudaMalloc(&d_bytes_used, bytes_used.size() * sizeof(uint32_t));
+    cudaMemset(d_bytes_used, 0, bytes_used.size() * sizeof(uint32_t));
 
     // Allocate for padded size and clear to 0
     cudaMalloc(&d_in, total_symbols);
@@ -389,11 +380,16 @@ int test(uint8_t* data, size_t length)
 
     // --- Launch with new parallel strategy ---
     encode_kernel << <nblocks, nthreads >> > (
-        d_buf, d_in, buf_stride, BLOCK_SIZE, symbols_per_thread, total_symbols);
+
+        d_buf, d_in, buf_stride, BLOCK_SIZE, symbols_per_thread, total_symbols, d_bytes_used);
 
     cudaEventRecord(stop_encode);
     cudaEventSynchronize(stop_encode);
-
+    cudaMemcpy(bytes_used.data(),          
+        d_bytes_used,                
+        bytes_used.size() * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost);
+    
     float encode_ms = 0.0f;
     cudaEventElapsedTime(&encode_ms, start_encode, stop_encode);
 

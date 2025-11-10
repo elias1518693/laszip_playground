@@ -39,9 +39,9 @@ vector<uint8_t> int32_to_bytes(const vector<int32_t>& input) {
     output.reserve(input.size() * sizeof(int32_t));
     for (int32_t val : input) {
         // Little-endian byte extraction (low byte first)
-        output.push_back(val & 0xFF);
-        output.push_back((val >> 8) & 0xFF);
-        output.push_back((val >> 16) & 0xFF);
+        //output.push_back(val & 0xFF);
+        //output.push_back((val >> 8) & 0xFF);
+        //output.push_back((val >> 16) & 0xFF);
         output.push_back((val >> 24) & 0xFF);
     }
     return output;
@@ -109,40 +109,42 @@ void update_history(std::deque<int32_t>& history, int32_t new_val) {
     history.push_back(new_val); // Add the newest
 }
 
-void print_histogram(const std::vector<int32_t>& data, const std::string& title, int num_bins = 20) {
+template <typename IntType>
+void print_histogram(const std::vector<IntType>& data, const std::string& title, int num_bins = 20)
+{
+    static_assert(std::is_integral_v<IntType>, "print_histogram requires an integer type");
+
     if (data.empty()) {
         std::println("Histogram: '{}' (No data)", title);
         return;
     }
 
     // 1. Find min and max
-    int32_t min_val = data[0];
-    int32_t max_val = data[0];
-    for (int32_t val : data) {
+    IntType min_val = data[0];
+    IntType max_val = data[0];
+    for (auto val : data) {
         if (val < min_val) min_val = val;
         if (val > max_val) max_val = val;
     }
 
     std::println("\n--- Histogram: {} ---", title);
     std::println("Total points: {}", data.size());
-    std::println("Min: {}, Max: {}", min_val, max_val);
+    std::println("Min: {}, Max: {}", static_cast<long long>(min_val), static_cast<long long>(max_val));
 
     if (min_val == max_val) {
-        std::println("[{}] count: {}", min_val, data.size());
+        std::println("[{}] count: {}", static_cast<long long>(min_val), data.size());
         return;
     }
 
     // 2. Determine bin size
-    // Use double for precision in bin calculation
-    double bin_size = (static_cast<double>(max_val) - min_val) / num_bins;
-    // Ensure bin size is at least 1, and adjust num_bins if range is discrete
+    double range = static_cast<double>(max_val) - static_cast<double>(min_val);
+    double bin_size = range / num_bins;
     if (bin_size < 1.0) {
         bin_size = 1.0;
-        num_bins = static_cast<int>(max_val - min_val) + 1;
-        // Cap bins if range is huge but discrete (e.g., -1000 to 1000)
+        num_bins = static_cast<int>(range) + 1;
         if (num_bins > 100) {
             num_bins = 100;
-            bin_size = (static_cast<double>(max_val) - min_val) / num_bins;
+            bin_size = range / num_bins;
         }
     }
 
@@ -150,56 +152,45 @@ void print_histogram(const std::vector<int32_t>& data, const std::string& title,
     std::vector<long long> bin_counts(num_bins, 0);
     long long max_count = 0;
 
-    for (int32_t val : data) {
-        int bin_index = 0;
-        if (bin_size > 0.0) {
-            bin_index = static_cast<int>((val - min_val) / bin_size);
-        }
-
-        // Put max_val into the last bin
+    for (auto val : data) {
+        int bin_index = static_cast<int>((static_cast<double>(val) - static_cast<double>(min_val)) / bin_size);
         if (bin_index >= num_bins) bin_index = num_bins - 1;
-        if (bin_index < 0) bin_index = 0; // Should not happen
-
+        if (bin_index < 0) bin_index = 0;
         bin_counts[bin_index]++;
-        if (bin_counts[bin_index] > max_count) {
+        if (bin_counts[bin_index] > max_count)
             max_count = bin_counts[bin_index];
-        }
     }
 
     // 4. Print histogram
     const int max_bar_width = 50;
     std::println("{:<25} | {:<10} | {}", "Bin Range", "Count", "Bar");
-    // std::println(std::string(25 + 13 + max_bar_width, '-')); // <-- PROBLEM
-    std::println("{}", std::string(25 + 13 + max_bar_width, '-')); // <-- FIX
+    std::println("{}", std::string(25 + 13 + max_bar_width, '-'));
 
     for (int i = 0; i < num_bins; ++i) {
-        int32_t bin_start = static_cast<int32_t>(min_val + i * bin_size);
-        int32_t bin_end = static_cast<int32_t>(min_val + (i + 1) * bin_size);
+        long long bin_start = static_cast<long long>(min_val) + static_cast<long long>(i * bin_size);
+        long long bin_end = static_cast<long long>(min_val) + static_cast<long long>((i + 1) * bin_size);
 
         std::string range_str;
-        // Make last bin inclusive
-        if (i == num_bins - 1) {
-            range_str = std::format("[{}, {}]", bin_start, max_val);
-        }
-        else {
+        if (i == num_bins - 1)
+            range_str = std::format("[{}, {}]", bin_start, static_cast<long long>(max_val));
+        else
             range_str = std::format("[{}, {})", bin_start, bin_end);
-        }
 
         long long count = bin_counts[i];
-        int bar_width = 0;
-        if (max_count > 0) {
-            bar_width = static_cast<int>((static_cast<double>(count) / max_count) * max_bar_width);
-        }
-        std::string bar(bar_width, '#');
+        int bar_width = (max_count > 0)
+            ? static_cast<int>((static_cast<double>(count) / max_count) * max_bar_width)
+            : 0;
 
+        std::string bar(bar_width, '#');
         std::println("{:<25} | {:<10} | {}", range_str, count, bar);
     }
+
     std::println("---------------------------------");
 }
 
 int main()
 {
-    string file = "./resources/pointclouds/bunny_small.laz";
+    string file = "./resources/pointclouds/ot_35120A4201B_1.laz";
 
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
@@ -316,11 +307,31 @@ int main()
             std::deque<int32_t>& dx_history = last_5_dx_by_m[m];
             std::deque<int32_t>& dy_history = last_5_dy_by_m[m];
 
+
+            if (dx_history.empty()) {
+                update_history(dx_history, X);
+                update_history(dy_history, Y);
+                int32_t predicted_Z = has_z_by_l[l] ? last_z_by_l[l] : prevZ;
+                corrected_deltaZ.push_back(Z - predicted_Z);
+                continue;
+            }
+            else if (dx_history.size() < 5) {
+                update_history(dx_history, X);
+                update_history(dy_history, Y);
+                continue;
+                corrected_deltaX.push_back(X - simple_dx);
+                corrected_deltaY.push_back(Y - simple_dy);
+                int32_t predicted_Z = has_z_by_l[l] ? last_z_by_l[l] : prevZ;
+                corrected_deltaZ.push_back(Z - predicted_Z);
+                continue;
+            }
+
             // 3. Predict deltas based on median of history
             int32_t predicted_dx = get_median(dx_history);
             int32_t predicted_dy = get_median(dy_history);
 
             // 4. Calculate the corrected delta (the value to be compressed)
+
             corrected_deltaX.push_back(X - predicted_dx);
             corrected_deltaY.push_back(Y - predicted_dy);
 
@@ -364,7 +375,7 @@ int main()
 
     // --- Print Histograms ---
     print_histogram(simple_deltaX, "Simple Delta X (Before Prediction)");
-    print_histogram(corrected_deltaX, "Corrected Delta X (After Prediction)");
+    print_histogram(int32_to_bytes(corrected_deltaX), "Corrected Delta X (After Prediction)");
 
     print_histogram(simple_deltaY, "Simple Delta Y (Before Prediction)");
     print_histogram(corrected_deltaY, "Corrected Delta Y (After Prediction)");
@@ -377,18 +388,6 @@ int main()
     if (!corrected_deltaX.empty()) {
         std::vector<uint8_t> dataX = int32_to_bytes(corrected_deltaX);
         std::println("Compressing X deltas ({} bytes)...", dataX.size());
-        //test(dataX.data(), dataX.size()); // Assuming test() is your compression function
-    }
-
-    if (!corrected_deltaY.empty()) {
-        std::vector<uint8_t> dataY = int32_to_bytes(corrected_deltaY);
-        std::println("Compressing Y deltas ({} bytes)...", dataY.size());
-        //test(dataY.data(), dataY.size()); // Uncomment to test Y
-    }
-
-    if (!corrected_deltaZ.empty()) {
-        std::vector<uint8_t> dataZ = int32_to_bytes(corrected_deltaZ);
-        std::println("Compressing Z deltas ({} bytes)...", dataZ.size());
-        //test(dataZ.data(), dataZ.size()); // Uncomment to test Z
+        test(dataX.data(), dataX.size()); // Assuming test() is your compression function
     }
 }
