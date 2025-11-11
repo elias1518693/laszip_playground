@@ -50,8 +50,13 @@ vector<uint8_t> int32_to_bytes(const vector<int32_t>& input) {
 vector<vector<uint8_t>> int32_to_bytes_split(const vector<int32_t>& input) {
     vector<vector<uint8_t>> output;
     output.reserve(input.size() * sizeof(int32_t));
+    output.push_back(vector<uint8_t>());
+    output.push_back(vector<uint8_t>());
+    output.push_back(vector<uint8_t>());
+    output.push_back(vector<uint8_t>());
     for (int32_t val : input) {
         // Little-endian byte extraction (low byte first)
+		
         output[0].push_back(val & 0xFF);
         output[1].push_back((val >> 8) & 0xFF);
         output[2].push_back((val >> 16) & 0xFF);
@@ -385,22 +390,16 @@ int main()
     }
 
     // --- Print Histograms ---
-
+    std::vector<vector<uint8_t>> dataX = int32_to_bytes_split(corrected_deltaX);
     // --- Print Histograms ---
-    print_histogram(simple_deltaX, "Simple Delta X (Before Prediction)");
-    print_histogram(int32_to_bytes(corrected_deltaX), "Corrected Delta X (After Prediction)");
-
-    print_histogram(simple_deltaY, "Simple Delta Y (Before Prediction)");
-    print_histogram(corrected_deltaY, "Corrected Delta Y (After Prediction)");
-
-    print_histogram(simple_deltaZ, "Simple Delta Z (Before Prediction)");
-    print_histogram(corrected_deltaZ, "Corrected Delta Z (After Prediction)");
-    // --- Compression Test ---
+    print_histogram(dataX[0], "Simple Delta X (0-7)");
+    print_histogram(dataX[1], "Simple Delta X (8-15)");
+    print_histogram(dataX[2], "Simple Delta X (16-23)");
+    print_histogram(dataX[3], "Simple Delta X (24-31)");
     // Now, compress the *corrected* deltas
 
     if (!corrected_deltaX.empty()) {
-        std::vector<vector<uint8_t>> dataX = int32_to_bytes_split(corrected_deltaX);
         std::println("Compressing X deltas ({} bytes)...", dataX.size());
-        test(dataX, dataX.size()); // Assuming test() is your compression function
+        test(dataX, dataX[0].size()); // Assuming test() is your compression function
     }
 }

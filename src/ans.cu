@@ -25,8 +25,18 @@
 
 #define RANS_BYTE_L (1u << 23) // lower bound of normalization interval
 
-#define SCALE_BITS 14             // 4096 total probability space
+#define SCALE_BITS 11             // 4096 total probability space
 #define ALPHABET_SIZE 256
+
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+    if (code != cudaSuccess)
+    {
+        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
 
 __device__ __constant__ uint16_t d_freq[ALPHABET_SIZE];
 __device__ __constant__ uint32_t d_cum[ALPHABET_SIZE];
@@ -134,15 +144,19 @@ __global__ void encode_kernel(uint8_t* outbuf, const uint8_t* in_data,
     }
     // --- End Inlined RansEncFlush ---
 
+    size_t length = (size_t)((mybuf + buf_stride) - ptr);
 
-    bytes_used[global_tid] = (uint32_t)((mybuf + buf_stride) - ptr); // Correct bytes_used calc
+    // 2. Store this length as the 'bytes_used' for this thread
+    bytes_used[global_tid] = (uint32_t)length;
+
+
 
     // Copy encoded data to the start
 }
 
 
-__global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
-    size_t block_size, int symbols_per_thread, uint8_t* out_symbols, size_t total_symbols)
+__global__ void decode_kernel(uint8_t* inbuf,
+    size_t block_size, int symbols_per_thread, uint8_t* out_symbols, size_t total_symbols, uint32_t* offsets)
 {
     // --- Warp-Parallel Coalesced Indexing ---
     int tid_in_block = threadIdx.x;
@@ -154,25 +168,22 @@ __global__ void decode_kernel(uint8_t* inbuf, size_t buf_stride,
     // Load freq tables to shared memory
     __shared__ uint16_t s_freq[ALPHABET_SIZE];
     __shared__ uint32_t s_cum[ALPHABET_SIZE];
-    for (int i = 0; i < 8; i++) {
-        int idx = threadIdx.x + i * 32; // 8 * 32 = 256
-        if (idx < ALPHABET_SIZE) {
-            s_freq[idx] = d_freq[idx];
-            s_cum[idx] = d_cum[idx];
-        }
-    }
+
+            s_freq[tid_in_block] = d_freq[tid_in_block];
+            s_cum[tid_in_block] = d_cum[tid_in_block];
+
     __syncthreads();
 
-    uint8_t* ptr = inbuf + global_tid * buf_stride; // Use global_tid
+    uint8_t* ptr = inbuf + offsets[global_tid]; // Use global_tid
 
-    uint32_t st; // <-- FIX: Declare the state variable
+    uint32_t st;
 
-    ptr += 4;
     {
-        st = ptr[0] << 0;
-        st |= ptr[1] << 8;
-        st |= ptr[2] << 16;
-        st |= ptr[3] << 24;
+        st = (uint32_t)ptr[0] << 0;
+        st |= (uint32_t)ptr[1] << 8;
+        st |= (uint32_t)ptr[2] << 16;
+        st |= (uint32_t)ptr[3] << 24;
+
         ptr += 4;
     }
 
@@ -368,10 +379,8 @@ int test(std::vector<std::vector<uint8_t>>& data, size_t length)
     cudaMemset(d_in, 0, total_symbols);
     cudaMemcpy(d_in, data[0].data(), length, cudaMemcpyHostToDevice); // Copy only valid data
 
-    cudaMalloc(&d_out, total_symbols);
-    cudaMemset(d_out, 0, total_symbols);
-
-
+    gpuErrchk(cudaMalloc(&d_out, total_symbols * sizeof(uint8_t)));
+    gpuErrchk(cudaMemset(d_out, 0, total_symbols * sizeof(uint8_t)));
     // --- Encode timing
     cudaEvent_t start_encode, stop_encode;
     cudaEventCreate(&start_encode);
@@ -389,20 +398,77 @@ int test(std::vector<std::vector<uint8_t>>& data, size_t length)
         d_bytes_used,                
         bytes_used.size() * sizeof(uint32_t),
         cudaMemcpyDeviceToHost);
-    
+    size_t total_compressed_size = 0;
+    for (uint32_t size : bytes_used) {
+        total_compressed_size += size;
+    }
+
+    // 2. Allocate a single, contiguous buffer on the host (CPU)
+    std::vector<uint8_t> h_final_output(total_compressed_size);
+
+    uint8_t* host_ptr = h_final_output.data(); // Current position in host buffer
+    size_t num_chunks = bytes_used.size(); // e.g., total_threads
+
+    for (size_t i = 0; i < num_chunks; ++i) {
+        if (bytes_used[i] > 0) {
+
+            // --- THIS IS THE FIX ---
+            // Calculate the correct source pointer on the GPU.
+            // It's at the end of the buffer, minus its own length.
+            uint8_t* gpu_source_ptr = d_buf + (i * buf_stride) + buf_stride - bytes_used[i];
+            // --- END OF FIX ---
+
+            // Destination: host_ptr
+            // Size: bytes_used[i]
+
+            // This cudaMemcpy is now grabbing the *correct* data
+            gpuErrchk(cudaMemcpy(host_ptr,
+                gpu_source_ptr,
+                bytes_used[i],
+                cudaMemcpyDeviceToHost));
+
+            // Move the host pointer forward for the next chunk
+            host_ptr += bytes_used[i];
+        }
+    }
+
+
+    std::vector<uint32_t> h_offsets(num_chunks);
+    uint32_t current_offset = 0;
+    for (size_t i = 0; i < num_chunks; ++i) {
+        h_offsets[i] = current_offset;
+        current_offset += bytes_used[i];
+    }
+
+    printf("Encoded length: %zu.\n", current_offset);
     float encode_ms = 0.0f;
     cudaEventElapsedTime(&encode_ms, start_encode, stop_encode);
 
+    uint8_t* coherrent_byte;
+    cudaMalloc(&coherrent_byte, total_compressed_size);
+    cudaMemcpy(coherrent_byte,
+        h_final_output.data(),
+        total_compressed_size,
+        cudaMemcpyHostToDevice);
+
+    uint32_t* d_offsets;
+    gpuErrchk(cudaMalloc(&d_offsets, h_offsets.size() * sizeof(uint32_t)));
+    gpuErrchk(cudaMemcpy(d_offsets,
+        h_offsets.data(),
+        h_offsets.size() * sizeof(uint32_t),
+        cudaMemcpyHostToDevice));
+
     // --- Decode timing
     cudaEvent_t start_decode, stop_decode;
-    cudaEventCreate(&start_decode);
-    cudaEventCreate(&stop_decode);
-    cudaEventRecord(start_decode);
+    gpuErrchk(cudaEventCreate(&start_decode));
+    gpuErrchk(cudaEventCreate(&stop_decode));
+    gpuErrchk(cudaEventRecord(start_decode));
 
     // --- Launch with new parallel strategy ---
     decode_kernel << <nblocks, nthreads >> > (
-        d_buf, buf_stride, BLOCK_SIZE, symbols_per_thread, d_out, total_symbols);
-
+        coherrent_byte, BLOCK_SIZE, symbols_per_thread, d_out, total_symbols, d_offsets);
+    gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaDeviceSynchronize());
     cudaEventRecord(stop_decode);
     cudaEventSynchronize(stop_decode);
 
@@ -421,7 +487,7 @@ int test(std::vector<std::vector<uint8_t>>& data, size_t length)
     for (size_t i = 0; i < length; ++i) { // Verify only original length
         if (h_out[i] != data[0][i]) {
             ok = false;
-            printf("Mismatch at index %zu: expected %d, got %d\n", i, data[i], h_out[i]);
+            printf("Mismatch at index %zu: expected %d, got %d\n", i, data[0][i], h_out[i]);
             break;
         }
     }
