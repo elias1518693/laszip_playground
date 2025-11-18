@@ -26,6 +26,7 @@
 
 #ifdef _WIN32
 #include <intrin.h>
+#include <map>
 #else
 // __clz for GCC/Clang
 static inline int __clz(uint32_t x) {
@@ -43,7 +44,7 @@ static inline int __clz(uint32_t x) {
 // *** FIX 5: Reduced L to prevent overflow in 32-bit registers ***
 #define RANS_BYTE_L (1u << 15) // lower bound of normalization interval (Standard for 32-bit rANS)
 
-#define SCALE_BITS 12           // 4096 total probability space
+#define SCALE_BITS 11           // 4096 total probability space
 #define ALPHABET_SIZE 256
 #define K_ALPHABET_SIZE 33      // k can be 0-32
 
@@ -739,6 +740,23 @@ void build_host_lookup(uint8_t* h_lookup, uint32_t* cum_freqs, int num_symbols, 
     }
 }
 
+double calculate_shannon_entropy(const std::vector<int32_t>& data) {
+    std::map<int32_t, uint64_t> counts;
+    for (int32_t val : data) {
+        counts[val]++;
+    }
+
+    double entropy = 0.0;
+    double total = (double)data.size();
+    for (auto const& [val, count] : counts) {
+        double p = (double)count / total;
+        entropy -= p * std::log2(p);
+    }
+
+    // Returns total entropy in MB
+    return (entropy * total) / (8.0 * 1024.0 * 1024.0);
+}
+
 int test(std::vector<int32_t>& data, size_t length)
 {
     if (length == 0) return 0;
@@ -762,10 +780,23 @@ int test(std::vector<int32_t>& data, size_t length)
 
     printf("Running test with %d blocks * %d threads = %d total threads.\n", nblocks, nthreads, total_threads);
     printf("Data Block Size: %zu symbols. Symbols per thread: %d.\n", BLOCK_SIZE, symbols_per_thread);
-    printf("Total Symbols (padded): %zu. Original length MB: %zu.\n", total_symbols, (length * 4) / 1024);
+    printf("Total Symbols (padded): %zu. Original length: %.2f MB.\n", total_symbols, (double)(length * sizeof(int32_t)) / (1024.0 * 1024.0));
+
+
+    double shannon_limit_mb = calculate_shannon_entropy(data);
+    printf("Theoretical Shannon Limit: %.2f MB (Absolute limit for lossless compression).\n", shannon_limit_mb);
 
     // --- 1. Process data on host ---
     k_code k_codes = int32_to_k_codes_9_context(data);
+    // Calculate Ideal Bit-Packed Size (Theoretical)
+    // This sums up the minimal bits needed for each integer (magnitude 'k')
+    // For k=0 (values 0 and 1), we count 1 bit because 0 bits cannot store information.
+    size_t total_packed_bits = 0;
+    for (uint8_t k : k_codes.k) {
+        total_packed_bits += (k == 0) ? 1 : k;
+    }
+    printf("Ideal Bit-Packed length: %.2f MB (Theoretical limit without entropy coding overhead).\n", (double)total_packed_bits / (8.0 * 1024.0 * 1024.0));
+
 
     // --- 2. Build Freq/Cum/Lookup tables for Symbols (Contexts 0-8) ---
     const size_t kLookupSize = (1 << SCALE_BITS);
@@ -911,7 +942,7 @@ int test(std::vector<int32_t>& data, size_t length)
         current_offset += bytes_used[i];
     }
 
-    printf("Encoded length MB: %zu.\n", (total_compressed_size / 1024) / 1024);
+    printf("Encoded length: %.2f MB.\n", (double)total_compressed_size / (1024.0 * 1024.0));
     float encode_ms = 0.0f;
     cudaEventElapsedTime(&encode_ms, start_encode, stop_encode);
 

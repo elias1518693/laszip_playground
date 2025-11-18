@@ -122,7 +122,7 @@ int32_t get_median(const std::deque<int32_t>& history) {
  * @param history The deque to update (by reference).
  * @param new_val The new value to add.
  */
-void update_history(std::deque<int32_t>& history, int32_t new_val) {
+static void update_history(std::deque<int32_t>& history, int32_t new_val) {
     if (history.size() >= 5) {
         history.pop_front(); // Remove the oldest
     }
