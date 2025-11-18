@@ -23,10 +23,14 @@
 #include <string.h> // for memset
 #include <algorithm> // for std::fill
 #include <limits> // for numeric_limits
+#include <cmath> // for log2
+#include <climits> // for CHAR_BIT
+#include <inttypes.h>
 
 #ifdef _WIN32
 #include <intrin.h>
 #include <map>
+#include <string>
 #else
 // __clz for GCC/Clang
 static inline int __clz(uint32_t x) {
@@ -757,13 +761,92 @@ double calculate_shannon_entropy(const std::vector<int32_t>& data) {
     return (entropy * total) / (8.0 * 1024.0 * 1024.0);
 }
 
+// Helper to print a simple text histogram (C++14 compatible)
+template <typename IntType>
+void print_histogram(const std::vector<IntType>& data, const char* title, int num_bins = 20)
+{
+    if (data.empty()) {
+        printf("Histogram: '%s' (No data)\n", title);
+        return;
+    }
+
+    // 1. Find min and max
+    IntType min_val = data[0];
+    IntType max_val = data[0];
+    for (auto val : data) {
+        if (val < min_val) min_val = val;
+        if (val > max_val) max_val = val;
+    }
+
+    printf("\n--- Histogram: %s ---\n", title);
+    printf("Total points: %zu\n", data.size());
+    printf("Min: %lld, Max: %lld\n", (long long)min_val, (long long)max_val);
+
+    if (min_val == max_val) {
+        printf("[%lld] count: %zu\n", (long long)min_val, data.size());
+        return;
+    }
+
+    // 2. Determine bin size
+    double range = (double)max_val - (double)min_val;
+    double bin_size = range / num_bins;
+    if (bin_size < 1.0) {
+        bin_size = 1.0;
+        num_bins = (int)range + 1;
+        if (num_bins > 50) { // Cap bins if range is small but large enough to spam
+            num_bins = 50;
+            bin_size = range / num_bins;
+        }
+    }
+
+    // 3. Populate bins
+    std::vector<long long> bin_counts(num_bins, 0);
+    long long max_count = 0;
+
+    for (auto val : data) {
+        int bin_index = (int)(((double)val - (double)min_val) / bin_size);
+        if (bin_index >= num_bins) bin_index = num_bins - 1;
+        if (bin_index < 0) bin_index = 0;
+        bin_counts[bin_index]++;
+        if (bin_counts[bin_index] > max_count)
+            max_count = bin_counts[bin_index];
+    }
+
+    // 4. Print histogram
+    const int max_bar_width = 40;
+    printf("%-25s | %-10s | %s\n", "Bin Range", "Count", "Bar");
+    for (int k = 0; k < 25 + 10 + 3 + max_bar_width; k++) printf("-");
+    printf("\n");
+
+    for (int i = 0; i < num_bins; ++i) {
+        long long bin_start = (long long)(min_val + i * bin_size);
+        long long bin_end = (long long)(min_val + (i + 1) * bin_size);
+
+        // Format range string manually
+        char range_buf[32];
+        if (i == num_bins - 1)
+            snprintf(range_buf, sizeof(range_buf), "[%lld, %lld]", bin_start, (long long)max_val);
+        else
+            snprintf(range_buf, sizeof(range_buf), "[%lld, %lld)", bin_start, bin_end);
+
+        long long count = bin_counts[i];
+        int bar_width = (max_count > 0)
+            ? (int)(((double)count / max_count) * max_bar_width)
+            : 0;
+
+        std::string bar(bar_width, '#');
+        printf("%-25s | %-10lld | %s\n", range_buf, count, bar.c_str());
+    }
+    printf("---------------------------------\n");
+}
+
 int test(std::vector<int32_t>& data, size_t length)
 {
     if (length == 0) return 0;
 
     // --- Configuration ---
     const int nthreads = 256;
-    const size_t LOG_BLOCK_SIZE = 20;
+    const size_t LOG_BLOCK_SIZE = 12;
     const size_t BLOCK_SIZE = 1 << LOG_BLOCK_SIZE;
     const int symbols_per_thread = BLOCK_SIZE / nthreads;
     const size_t buf_stride = symbols_per_thread * 32;
@@ -788,6 +871,16 @@ int test(std::vector<int32_t>& data, size_t length)
 
     // --- 1. Process data on host ---
     k_code k_codes = int32_to_k_codes_9_context(data);
+
+	print_histogram<uint8_t>(k_codes.k, "'k' Values Histogram", 33);
+    for (int i = 0; i < 9; ++i) {
+        if (!k_codes.upper_byte[i].empty()) {
+            std::string title = "Context " + std::to_string(i) + " Symbols";
+            // Use 256 bins if we have enough data to see the full byte range details
+            int bins = (k_codes.upper_byte[i].size() > 500) ? 64 : 20;
+            print_histogram(k_codes.upper_byte[i], title.c_str(), bins);
+        }
+    }
     // Calculate Ideal Bit-Packed Size (Theoretical)
     // This sums up the minimal bits needed for each integer (magnitude 'k')
     // For k=0 (values 0 and 1), we count 1 bit because 0 bits cannot store information.
