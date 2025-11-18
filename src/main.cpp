@@ -65,6 +65,8 @@ vector<vector<uint8_t>> int32_to_bytes_split(const vector<int32_t>& input) {
     return output;
 }
 
+
+
 /**
  * @brief Converts a little-endian byte vector back to a vector of int32_t.
  * @param input Vector of 8-bit unsigned integers.
@@ -206,6 +208,23 @@ void print_histogram(const std::vector<IntType>& data, const std::string& title,
     std::println("---------------------------------");
 }
 
+struct k_code {
+    // Stores the "Corrector" (upper bits) to be arithmetically coded.
+    // We have 33 vectors, one for each k (0-32).
+    std::vector<std::vector<uint8_t>> upper_byte;
+
+    // Stores the k-value for each delta
+    std::vector<uint8_t> k;
+
+    // Stores the "lower bits" (k-8 bits) to be stored raw.
+    std::vector<uint32_t> raw_bits;
+};
+
+/**
+ * Maps the signed delta 'c' to a positive value for the encoder,
+ * based on the 'k' found, as per LAZ spec 10.5.5 .
+ */
+
 int main()
 {
     string file = "./resources/pointclouds/ot_35120A4201B_1.laz";
@@ -246,6 +265,9 @@ int main()
         return 1;
     }
 
+
+
+
     // These will store the final *corrected* deltas to be compressed
     vector<int32_t> corrected_deltaX;
     vector<int32_t> corrected_deltaY;
@@ -278,7 +300,7 @@ int main()
 
 
     uint64_t total_points = lazHeader->number_of_point_records;
-    const int pointLimit = min((int)total_points, 500000000);
+    const int pointLimit = min((int)total_points, 5000000);
 
     std::println("Reading {} points from '{}'...", pointLimit, file);
 
@@ -392,14 +414,14 @@ int main()
     // --- Print Histograms ---
     std::vector<vector<uint8_t>> dataX = int32_to_bytes_split(corrected_deltaX);
     // --- Print Histograms ---
-    print_histogram(dataX[0], "Simple Delta X (0-7)");
-    print_histogram(dataX[1], "Simple Delta X (8-15)");
-    print_histogram(dataX[2], "Simple Delta X (16-23)");
-    print_histogram(dataX[3], "Simple Delta X (24-31)");
+    //print_histogram(dataX[0], "Simple Delta X (0-7)");
+    //print_histogram(dataX[1], "Simple Delta X (8-15)");
+    //print_histogram(dataX[2], "Simple Delta X (16-23)");
+    //print_histogram(dataX[3], "Simple Delta X (24-31)");
     // Now, compress the *corrected* deltas
 
     if (!corrected_deltaX.empty()) {
         std::println("Compressing X deltas ({} bytes)...", dataX.size());
-        test(dataX, dataX[0].size()); // Assuming test() is your compression function
+        test(corrected_deltaX, corrected_deltaX.size()); // Assuming test() is your compression function
     }
 }
