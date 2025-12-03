@@ -227,7 +227,7 @@ struct k_code {
 
 int main()
 {
-    string file = "./resources/pointclouds/ot_35120A4201B_1.laz";
+    string file = "./resources/pointclouds/ot_35120A4201B_1_nocolor.laz";
 
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
@@ -275,6 +275,21 @@ int main()
     vector<int32_t> simple_deltaX;
     vector<int32_t> simple_deltaY;
     vector<int32_t> simple_deltaZ;
+
+    vector<int32_t> stream_BitByte;
+    vector<int32_t> stream_Classification;
+    vector<int32_t> stream_UserData;
+
+    // These are 16-bit or 8-bit deltas, but we store in int32 for the compressor
+    vector<int32_t> stream_dIntensity;
+    vector<int32_t> stream_dScanAngle;
+    vector<int32_t> stream_dPointSource;
+
+    // Previous state for delta fields
+    uint16_t last_Intensity = 0;
+    int16_t  last_ScanAngle = 0;
+    uint16_t last_PointSource = 0;
+
     // State for prediction
     int32_t prevX = 0, prevY = 0, prevZ = 0;
     bool first = true;
@@ -305,6 +320,35 @@ int main()
     std::println("Reading {} points from '{}'...", pointLimit, file);
 
     for (int i = 0; i < pointLimit; i++) {
+        uint8_t bit_byte = (laz_point->return_number & 0x07) |
+            ((laz_point->number_of_returns & 0x07) << 3) |
+            ((laz_point->scan_direction_flag & 0x01) << 6) |
+            ((laz_point->edge_of_flight_line & 0x01) << 7);
+
+        // For BitByte, Class, and UserData, raw values usually compress better 
+        // than deltas because they tend to be constant for long runs.
+        stream_BitByte.push_back(bit_byte);
+        stream_Classification.push_back(laz_point->classification);
+        stream_UserData.push_back(laz_point->user_data);
+
+        // 2. Delta Fields
+        // Intensity, Scan Angle, and Point Source usually drift, so Deltas are better.
+
+        // Intensity (Delta)
+        int32_t dIntensity = (int32_t)laz_point->intensity - (int32_t)last_Intensity;
+        stream_dIntensity.push_back(dIntensity);
+        last_Intensity = laz_point->intensity;
+
+        // Scan Angle Rank (Delta)
+        int32_t dScanAngle = (int32_t)laz_point->scan_angle_rank - (int32_t)last_ScanAngle;
+        stream_dScanAngle.push_back(dScanAngle);
+        last_ScanAngle = laz_point->scan_angle_rank;
+
+        // Point Source ID (Delta)
+        int32_t dPointSource = (int32_t)laz_point->point_source_ID - (int32_t)last_PointSource;
+        stream_dPointSource.push_back(dPointSource);
+        last_PointSource = laz_point->point_source_ID;
+
         if (laszip_read_point(laszip_reader) != 0) {
             std::println(stderr, "Warning: Error reading point {}. Stopping.", i);
             break;
@@ -421,8 +465,8 @@ int main()
     // Now, compress the *corrected* deltas
 
     if (!corrected_deltaX.empty()) {
-        std::println("Compressing X deltas ({} bytes)...", corrected_deltaX.size());
-
+        
+        /*
         int repeat = 32;   // repeat twice = double size
         size_t orig = corrected_deltaX.size();
         corrected_deltaX.reserve(orig* repeat);
@@ -431,7 +475,16 @@ int main()
             corrected_deltaX.insert(corrected_deltaX.end(),
                 corrected_deltaX.begin(),
                 corrected_deltaX.begin() + orig);
-
+        std::println("Compressing X deltas ({} bytes)...", corrected_deltaX.size());
+        */
         compress_stream_gpu(corrected_deltaX, "dX Stream"); // Assuming test() is your compression function
+        compress_stream_gpu(corrected_deltaY, "dY Stream");
+        compress_stream_gpu(corrected_deltaZ, "dZ Stream");
+        compress_stream_gpu(stream_dIntensity, "dIntensity");
+        compress_stream_gpu(stream_BitByte, "BitByte");
+        compress_stream_gpu(stream_Classification, "Classification");
+        compress_stream_gpu(stream_dScanAngle, "dScanAngle");
+        compress_stream_gpu(stream_UserData, "UserData");
+        compress_stream_gpu(stream_dPointSource, "dPointSource");
     }
 }
