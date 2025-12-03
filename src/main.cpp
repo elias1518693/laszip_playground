@@ -300,7 +300,7 @@ int main()
 
 
     uint64_t total_points = lazHeader->number_of_point_records;
-    const int pointLimit = min((int)total_points, 500000000);
+    const int pointLimit = min((int)total_points, 50000000);
 
     std::println("Reading {} points from '{}'...", pointLimit, file);
 
@@ -421,7 +421,17 @@ int main()
     // Now, compress the *corrected* deltas
 
     if (!corrected_deltaX.empty()) {
-        std::println("Compressing X deltas ({} bytes)...", dataX.size());
-        test(corrected_deltaX, corrected_deltaX.size()); // Assuming test() is your compression function
+        std::println("Compressing X deltas ({} bytes)...", corrected_deltaX.size());
+
+        int repeat = 32;   // repeat twice = double size
+        size_t orig = corrected_deltaX.size();
+        corrected_deltaX.reserve(orig* repeat);
+
+        for (int i = 1; i < repeat; i++)
+            corrected_deltaX.insert(corrected_deltaX.end(),
+                corrected_deltaX.begin(),
+                corrected_deltaX.begin() + orig);
+
+        compress_stream_gpu(corrected_deltaX, "dX Stream"); // Assuming test() is your compression function
     }
 }
