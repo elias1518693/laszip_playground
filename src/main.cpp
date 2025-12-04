@@ -65,8 +65,28 @@ vector<vector<uint8_t>> int32_to_bytes_split(const vector<int32_t>& input) {
     return output;
 }
 
+template <typename T>
+void compress_chunked(const std::vector<T>& data, const char* name, size_t chunk_size = 65536) {
+    if (data.empty()) return;
 
+    std::println("--- Compressing {} (Chunked) ---", name);
+    size_t total_compressed_size = 0;
 
+    // Simple loop to emulate block-adaptive coding
+    for (size_t i = 0; i < data.size(); i += chunk_size) {
+        size_t end = std::min(i + chunk_size, data.size());
+
+        // Create a view/copy of the chunk
+        // (std::vector constructor using iterators is efficient enough for this test)
+        std::vector<T> chunk(data.begin() + i, data.begin() + end);
+
+        // This will print stats for each chunk - you might want to silence the per-chunk prints
+        // and just sum up the sizes.
+        // Ideally, modify compress_stream_gpu to return the size instead of printing.
+        total_compressed_size += compress_stream_gpu(chunk, "Chunk");
+    }
+    printf("[%s] Encoded Size: %.2f MB\n", name, (double)total_compressed_size / 1024 / 1024);
+}
 /**
  * @brief Converts a little-endian byte vector back to a vector of int32_t.
  * @param input Vector of 8-bit unsigned integers.
@@ -276,9 +296,9 @@ int main()
     vector<int32_t> simple_deltaY;
     vector<int32_t> simple_deltaZ;
 
-    vector<int32_t> stream_BitByte;
-    vector<int32_t> stream_Classification;
-    vector<int32_t> stream_UserData;
+    vector<int8_t> stream_BitByte;
+    vector<int8_t> stream_Classification;
+    vector<int8_t> stream_UserData;
 
     // These are 16-bit or 8-bit deltas, but we store in int32 for the compressor
     vector<int32_t> stream_dIntensity;
@@ -286,7 +306,7 @@ int main()
     vector<int32_t> stream_dPointSource;
 
     // Previous state for delta fields
-    uint16_t last_Intensity = 0;
+
     int16_t  last_ScanAngle = 0;
     uint16_t last_PointSource = 0;
 
@@ -313,6 +333,7 @@ int main()
     std::vector<int32_t> last_z_by_l(MAX_RETURNS, 0);
     std::vector<bool> has_z_by_l(MAX_RETURNS, false); // Track if we have a value
 
+    std::vector<int32_t> last_intensity_by_m(MAX_RETURN_MAPS, 0);
 
     uint64_t total_points = lazHeader->number_of_point_records;
     const int pointLimit = min((int)total_points, 50000000);
@@ -331,13 +352,20 @@ int main()
         stream_Classification.push_back(laz_point->classification);
         stream_UserData.push_back(laz_point->user_data);
 
-        // 2. Delta Fields
-        // Intensity, Scan Angle, and Point Source usually drift, so Deltas are better.
-
+        // 'l' (return level) is the return_number
+        uint8_t l = laz_point->return_number;
+        // 'm' (return map) is the combination of number_of_returns and return_number
+        // We shift by 5 bits to accommodate up to 31 returns.
+        uint16_t m = (laz_point->number_of_returns << 5) | laz_point->return_number;
+        if (m >= MAX_RETURN_MAPS) m = 0; // Fallback or handle error
         // Intensity (Delta)
-        int32_t dIntensity = (int32_t)laz_point->intensity - (int32_t)last_Intensity;
+        int32_t pred_Intensity = last_intensity_by_m[m];
+        int32_t dIntensity = (int32_t)laz_point->intensity - pred_Intensity;
+
         stream_dIntensity.push_back(dIntensity);
-        last_Intensity = laz_point->intensity;
+
+        // Update history for this specific 'm'
+        last_intensity_by_m[m] = laz_point->intensity;
 
         // Scan Angle Rank (Delta)
         int32_t dScanAngle = (int32_t)laz_point->scan_angle_rank - (int32_t)last_ScanAngle;
@@ -358,12 +386,7 @@ int main()
         int32_t Y = laz_point->Y;
         int32_t Z = laz_point->Z;
 
-        // Get return info
-        // 'l' (return level) is the return_number
-        uint8_t l = laz_point->return_number;
-        // 'm' (return map) is the combination of number_of_returns and return_number
-        // We shift by 5 bits to accommodate up to 31 returns.
-        uint16_t m = (laz_point->number_of_returns << 5) | laz_point->return_number;
+
 
         // Bounds check
         if (l >= MAX_RETURNS || m >= MAX_RETURN_MAPS) {
@@ -477,14 +500,14 @@ int main()
                 corrected_deltaX.begin() + orig);
         std::println("Compressing X deltas ({} bytes)...", corrected_deltaX.size());
         */
-        compress_stream_gpu(corrected_deltaX, "dX Stream"); // Assuming test() is your compression function
-        compress_stream_gpu(corrected_deltaY, "dY Stream");
-        compress_stream_gpu(corrected_deltaZ, "dZ Stream");
-        compress_stream_gpu(stream_dIntensity, "dIntensity");
-        compress_stream_gpu(stream_BitByte, "BitByte");
-        compress_stream_gpu(stream_Classification, "Classification");
-        compress_stream_gpu(stream_dScanAngle, "dScanAngle");
-        compress_stream_gpu(stream_UserData, "UserData");
-        compress_stream_gpu(stream_dPointSource, "dPointSource");
+        compress_chunked(corrected_deltaX, "dX Stream"); // Assuming test() is your compression function
+        compress_chunked(corrected_deltaY, "dY Stream");
+        compress_chunked(corrected_deltaZ, "dZ Stream");
+        compress_chunked(stream_dIntensity, "dIntensity");
+        compress_chunked(stream_BitByte, "BitByte");
+        compress_chunked(stream_Classification, "Classification");
+        compress_chunked(stream_dScanAngle, "dScanAngle");
+        compress_chunked(stream_UserData, "UserData");
+        compress_chunked(stream_dPointSource, "dPointSource");
     }
 }

@@ -186,6 +186,66 @@ __global__ void k_encode_simple(
     out_sizes[global_tid] = (uint32_t)(end_ptr - ptr);
 }
 
+
+__global__ void encode_simple_byte(
+    uint8_t* out_buf,
+    const uint8_t* in_data, // Input is raw uint8_t symbols
+    uint32_t* out_sizes,
+    size_t total_symbols,
+    int symbols_per_thread,
+    const uint32_t* freq_sym,
+    const uint32_t* start_sym,
+    int num_chunks,
+    int chunk_stride_bytes
+) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    size_t global_tid = bid * blockDim.x + tid;
+
+    if (global_tid >= num_chunks) return;
+
+    // RANS state
+    uint32_t s = RANS_BYTE_L;
+
+    // Encoder writes BACKWARDS from the END of the slot
+    uint8_t* end_ptr = out_buf + (global_tid * chunk_stride_bytes) + chunk_stride_bytes;
+    uint8_t* ptr = end_ptr;
+
+    size_t start_idx = global_tid * symbols_per_thread;
+
+    // Encode Backwards
+    for (int i = symbols_per_thread - 1; i >= 0; --i) {
+        size_t idx = start_idx + i;
+        if (idx >= total_symbols) continue;
+
+        uint8_t sym = in_data[idx];
+
+        uint32_t f = freq_sym[sym];
+        uint32_t st = start_sym[sym];
+
+        // Renormalize (if s is too large, output bytes)
+        // max = ((RANS_BYTE_L >> SCALE_BITS) << 8) * f;
+        // Optimization: The comparison is equivalent to:
+        // s >= (freq << (31 - SCALE_BITS)) ??? 
+        // We stick to the standard readable version:
+        uint32_t max = ((RANS_BYTE_L >> SCALE_BITS) << 8) * f;
+
+        while (s >= max) {
+            *--ptr = (uint8_t)(s & 0xff);
+            s >>= 8;
+        }
+
+        // Update State
+        s = ((s / f) << SCALE_BITS) + (s % f) + st;
+    }
+
+    // Write final state
+    *--ptr = (s >> 24); *--ptr = (s >> 16); *--ptr = (s >> 8); *--ptr = s;
+
+    // Size is the distance from current ptr to the end of the slot
+    out_sizes[global_tid] = (uint32_t)(end_ptr - ptr);
+}
+
 // 3. Compactor Kernel (New!)
 // Moves chunks from strided buffer to dense buffer based on offsets
 __global__ void k_compact_chunks(
@@ -328,6 +388,67 @@ __global__ void k_decode_shared(
     }
 }
 
+__global__ void decode_shared_byte(
+    const uint8_t* __restrict__ in_buf,
+    int8_t* __restrict__ out_data, // Output is int8_t
+    const uint32_t* offsets,
+    const uint8_t* __restrict__ global_lookup_sym,
+    const uint32_t* __restrict__ global_freq_sym,
+    const uint32_t* __restrict__ global_start_sym,
+    size_t total_symbols,
+    int symbols_per_thread,
+    int num_chunks
+) {
+    // Shared memory for fast lookup
+    __shared__ uint8_t s_lookup_sym[PROB_SCALE];
+
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+
+    // Load lookups collaboratively 
+    for (int i = tid; i < PROB_SCALE; i += bdim) {
+        s_lookup_sym[i] = global_lookup_sym[i];
+    }
+    __syncthreads();
+
+    size_t global_tid = blockIdx.x * blockDim.x + tid;
+    if (global_tid >= num_chunks) return;
+
+    size_t block_start_idx = global_tid * symbols_per_thread;
+
+    // Setup pointer based on compact buffer offsets
+    const uint8_t* ptr = in_buf + offsets[global_tid];
+
+    // Read initial state
+    uint32_t s = ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
+    ptr += 4;
+
+    // Decode Loop
+    for (int i = 0; i < symbols_per_thread; ++i) {
+        size_t out_idx = block_start_idx + i;
+        if (out_idx >= total_symbols) break;
+
+        // 1. Get Symbol
+        uint32_t slot = s & (PROB_SCALE - 1);
+        uint8_t sym = s_lookup_sym[slot];
+
+        // 2. Write Output
+        out_data[out_idx] = (int8_t)sym;
+
+        // 3. Advance rANS state
+        uint32_t freq = global_freq_sym[sym];
+        uint32_t start = global_start_sym[sym];
+
+        // s = freq * (s / PROB_SCALE) + (slot - start)
+        s = freq * (s >> SCALE_BITS) + (slot - start);
+
+        // 4. Renormalize (Refill state from stream)
+        while (s < RANS_BYTE_L) {
+            s = (s << 8) | *ptr++;
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 // Host Logic
 // --------------------------------------------------------------------------
@@ -372,7 +493,7 @@ void normalize_freqs(std::vector<uint32_t>& freqs, std::vector<uint32_t>& starts
 
 int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     if (data.empty()) return 0;
-    printf("[%s] size: %.2f MB \n",name, double (data.size() * 4)/1024/1024);
+    //printf("[%s] size: %.2f MB \n",name, double (data.size() * 4)/1024/1024);
     size_t n = data.size();
 
     // 1. Buffers for Splitting
@@ -452,7 +573,7 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("[%s] Encode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
+    //printf("[%s] Encode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
     // 5. Compaction (Scan + Gather)
 
     // A. Prefix Sum (Scan) on Sizes
@@ -480,7 +601,7 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
         );
     gpuErrchk(cudaDeviceSynchronize());
 
-    printf("[%s] Encoded Size: %.2f MB\n", name, (double)total_compressed / 1024 / 1024);
+    //printf("[%s] Encoded Size: %.2f MB\n", name, (double)total_compressed / 1024 / 1024);
 
     // 6. Decode
     int32_t* d_decoded;
@@ -503,7 +624,7 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&ms, start, stop);
 
-    printf("[%s] Decode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
+    //printf("[%s] Decode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
 
     // Verify
     std::vector<int32_t> h_verify(n);
@@ -523,7 +644,151 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     cudaFree(tables.enc_freq_k); cudaFree(tables.enc_start_k);
     cudaFree(tables.enc_freq_sym); cudaFree(tables.enc_start_sym);
 
-    return 0;
+    return total_compressed;
 }
 
 
+
+
+int compress_stream_gpu(const std::vector<int8_t>& data, const char* name) {
+    if (data.empty()) return 0;
+
+    // Correct size calculation for int8_t
+    //printf("[%s] Input Size: %.2f MB\n", name, double(data.size()) / 1024.0 / 1024.0);
+    size_t n = data.size();
+
+    // 1. Device Setup (Input is uint8_t equivalent)
+    uint8_t* d_in;
+    gpuErrchk(cudaMalloc(&d_in, n)); // Allocate exactly n bytes
+
+    // Cast int8_t data to uint8_t for internal processing
+    gpuErrchk(cudaMemcpy(d_in, data.data(), n, cudaMemcpyHostToDevice));
+
+    // 2. Frequency Analysis (Host)
+    // We can do this on CPU for simplicity as per original code
+    std::vector<uint32_t> freq_sym(256, 0);
+
+    // Treat int8_t as uint8_t (0-255) for frequency counting
+    const uint8_t* raw_ptr = (const uint8_t*)data.data();
+    for (size_t i = 0; i < n; ++i) {
+        freq_sym[raw_ptr[i]]++;
+    }
+
+    std::vector<uint32_t> start_sym(257);
+    normalize_freqs(freq_sym, start_sym); // Reuse existing helper
+
+    std::vector<uint8_t> lut_sym(PROB_SCALE);
+    // Use freq_sym data size 256
+    build_lookup(lut_sym.data(), start_sym.data(), freq_sym.data(), 256);
+
+    // 3. Tables to GPU
+    DeviceTables tables;
+    gpuErrchk(cudaMalloc(&tables.lookup_sym, PROB_SCALE));
+    gpuErrchk(cudaMalloc(&tables.enc_freq_sym, 256 * 4));
+    gpuErrchk(cudaMalloc(&tables.enc_start_sym, 256 * 4));
+
+    gpuErrchk(cudaMemcpy(tables.lookup_sym, lut_sym.data(), PROB_SCALE, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.enc_freq_sym, freq_sym.data(), 256 * 4, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.enc_start_sym, start_sym.data(), 256 * 4, cudaMemcpyHostToDevice));
+
+    // 4. Encode
+    int sym_per_thread = 2048;
+    size_t total_syms = ((n + sym_per_thread - 1) / sym_per_thread) * sym_per_thread;
+    int enc_threads = total_syms / sym_per_thread;
+    int enc_blocks = (enc_threads + 255) / 256;
+
+    // Stride estimation: 1 byte input -> max ~1.01 bytes output usually, 
+    // but rANS can expand slightly if entropy is max. 
+    // sym_per_thread * 2 is plenty safe for int8.
+    int chunk_stride = sym_per_thread * 2 + 16;
+
+    uint8_t* d_comp_buf;
+    uint32_t* d_comp_sizes;
+    gpuErrchk(cudaMalloc(&d_comp_buf, enc_threads * chunk_stride));
+    gpuErrchk(cudaMalloc(&d_comp_sizes, enc_threads * 4));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    encode_simple_byte << <enc_blocks, 256 >> > (
+        d_comp_buf, d_in, d_comp_sizes,
+        n, sym_per_thread,
+        tables.enc_freq_sym, tables.enc_start_sym,
+        enc_threads, chunk_stride
+        );
+    gpuErrchk(cudaDeviceSynchronize());
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    //printf("[%s] Encode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n) / (ms / 1000.0) / 1024 / 1024);
+
+    // 5. Compaction (Scan + Gather)
+    uint32_t* d_dec_offsets;
+    gpuErrchk(cudaMalloc(&d_dec_offsets, enc_threads * 4));
+
+    // Exclusive scan
+    thrust::exclusive_scan(thrust::device, d_comp_sizes, d_comp_sizes + enc_threads, d_dec_offsets);
+
+    // Calculate Total Size
+    uint32_t last_size, last_offset;
+    gpuErrchk(cudaMemcpy(&last_size, d_comp_sizes + enc_threads - 1, 4, cudaMemcpyDeviceToHost));
+    gpuErrchk(cudaMemcpy(&last_offset, d_dec_offsets + enc_threads - 1, 4, cudaMemcpyDeviceToHost));
+    size_t total_compressed = last_offset + last_size;
+
+    uint8_t* d_coherent_buf;
+    gpuErrchk(cudaMalloc(&d_coherent_buf, total_compressed));
+
+    // Compact
+    k_compact_chunks << <enc_threads, 256 >> > (
+        d_comp_buf, d_coherent_buf,
+        d_comp_sizes, d_dec_offsets,
+        enc_threads, chunk_stride
+        );
+    gpuErrchk(cudaDeviceSynchronize());
+
+    //printf("[%s] Encoded Size: %.2f MB (Ratio: %.2f:1)\n", name, (double)total_compressed / 1024 / 1024, (double)n / total_compressed);
+
+    // 6. Decode
+    int8_t* d_decoded;
+    gpuErrchk(cudaMalloc(&d_decoded, n)); // Allocate exactly n bytes
+
+    cudaEventRecord(start);
+    decode_shared_byte << <enc_blocks, 256 >> > (
+        d_coherent_buf, d_decoded, d_dec_offsets,
+        tables.lookup_sym, tables.enc_freq_sym, tables.enc_start_sym,
+        n, sym_per_thread,
+        enc_threads
+        );
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+
+    //printf("[%s] Decode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n) / (ms / 1000.0) / 1024 / 1024);
+
+    // Verify
+    std::vector<int8_t> h_verify(n);
+    gpuErrchk(cudaMemcpy(h_verify.data(), d_decoded, n, cudaMemcpyDeviceToHost));
+
+    int errors = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (h_verify[i] != data[i]) {
+            printf("FAIL at %zu. Exp %d Got %d\n", i, data[i], h_verify[i]);
+            errors++;
+            if (errors > 10) break;
+        }
+    }
+    //if (errors == 0) printf("[%s] Verification Passed.\n", name);
+
+    // Free
+    cudaFree(d_in);
+    cudaFree(d_comp_buf); cudaFree(d_comp_sizes);
+    cudaFree(d_coherent_buf); cudaFree(d_dec_offsets);
+    cudaFree(d_decoded);
+    cudaFree(tables.lookup_sym);
+    cudaFree(tables.enc_freq_sym); cudaFree(tables.enc_start_sym);
+
+    return total_compressed;
+}
