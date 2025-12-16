@@ -26,7 +26,8 @@
 #include "laszip/laszip_api.h"
 // Include the header for the compression test function
 #include "ans.cuh"
-
+#include "dietans.cuh"
+#include "simple_coding.cuh"
 using namespace std;
 
 /**
@@ -247,7 +248,7 @@ struct k_code {
 
 int main()
 {
-    string file = "./resources/pointclouds/ot_35120A4201B_1_nocolor.laz";
+    string file = "./resources/pointclouds/large.laz";
 
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
@@ -481,7 +482,16 @@ int main()
     // --- Print Histograms ---
     std::vector<vector<uint8_t>> dataX = int32_to_bytes_split(corrected_deltaX);
     // --- Print Histograms ---
-    //print_histogram(dataX[0], "Simple Delta X (0-7)");
+    
+    print_histogram(corrected_deltaX, "Delta X");
+    print_histogram(corrected_deltaY, "Delta Y");
+    print_histogram(corrected_deltaZ, "Delta Z");
+    print_histogram(stream_dIntensity, "Intensity");
+    print_histogram(stream_BitByte, "BitByte");
+    print_histogram(stream_dScanAngle, "scanAngle");
+    print_histogram(stream_UserData, "UserData");
+    print_histogram(stream_dPointSource, "dPointSource");
+    
     //print_histogram(dataX[1], "Simple Delta X (8-15)");
     //print_histogram(dataX[2], "Simple Delta X (16-23)");
     //print_histogram(dataX[3], "Simple Delta X (24-31)");
@@ -500,14 +510,15 @@ int main()
                 corrected_deltaX.begin() + orig);
         std::println("Compressing X deltas ({} bytes)...", corrected_deltaX.size());
         */
-        compress_chunked(corrected_deltaX, "dX Stream"); // Assuming test() is your compression function
-        compress_chunked(corrected_deltaY, "dY Stream");
-        compress_chunked(corrected_deltaZ, "dZ Stream");
-        compress_chunked(stream_dIntensity, "dIntensity");
-        compress_chunked(stream_BitByte, "BitByte");
-        compress_chunked(stream_Classification, "Classification");
-        compress_chunked(stream_dScanAngle, "dScanAngle");
-        compress_chunked(stream_UserData, "UserData");
-        compress_chunked(stream_dPointSource, "dPointSource");
+        compress_stream_aatrox(corrected_deltaX, "dX Stream"); // Assuming test() is your compression function
+        compress_stream_aatrox(corrected_deltaY, "dY Stream");
+        compress_stream_aatrox(corrected_deltaZ, "dZ Stream");
+        compress_stream_aatrox(stream_dIntensity, "dIntensity");
+        //compress_stream_aatrox(stream_BitByte, "BitByte");
+        //compress_stream_aatrox(stream_Classification, "Classification");
+        compress_stream_aatrox(stream_dScanAngle, "dScanAngle");
+        //compress_stream_aatrox(stream_UserData, "UserData");
+        compress_stream_aatrox(stream_dPointSource, "dPointSource");
+        
     }
 }

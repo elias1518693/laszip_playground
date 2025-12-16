@@ -10,12 +10,11 @@
 #include <algorithm>
 #include <iostream>
 #include <cstring>
-
 // Thrust is required for the prefix sum (scan) operation
 #include <thrust/scan.h>
 #include <thrust/execution_policy.h>
 
-#define RANS_BYTE_L (1u << 15)
+#define RANS_BYTE_L (1u << 23)
 #define SCALE_BITS 12 
 #define PROB_SCALE (1 << SCALE_BITS)
 
@@ -133,7 +132,7 @@ __global__ void k_encode_simple(
     int bit_cnt = 0;
 
     size_t start_idx = global_tid * symbols_per_thread;
-
+    uint32_t pre = ((RANS_BYTE_L >> SCALE_BITS) << 8);
     // Encode Backwards
     for (int i = symbols_per_thread - 1; i >= 0; --i) {
         size_t idx = start_idx + i;
@@ -157,7 +156,7 @@ __global__ void k_encode_simple(
         if (k != 32) {
             uint32_t f = freq_sym[sym];
             uint32_t st = start_sym[sym];
-            uint32_t max = ((RANS_BYTE_L >> SCALE_BITS) << 8) * f;
+            uint32_t max = pre * f;
             while (s >= max) {
                 *--ptr = (uint8_t)(s & 0xff);
                 s >>= 8;
@@ -212,7 +211,7 @@ __global__ void encode_simple_byte(
     uint8_t* ptr = end_ptr;
 
     size_t start_idx = global_tid * symbols_per_thread;
-
+    uint32_t pre = ((RANS_BYTE_L >> SCALE_BITS) << 8);
     // Encode Backwards
     for (int i = symbols_per_thread - 1; i >= 0; --i) {
         size_t idx = start_idx + i;
@@ -228,7 +227,7 @@ __global__ void encode_simple_byte(
         // Optimization: The comparison is equivalent to:
         // s >= (freq << (31 - SCALE_BITS)) ??? 
         // We stick to the standard readable version:
-        uint32_t max = ((RANS_BYTE_L >> SCALE_BITS) << 8) * f;
+        uint32_t max = pre * f;
 
         while (s >= max) {
             *--ptr = (uint8_t)(s & 0xff);
@@ -490,10 +489,150 @@ void normalize_freqs(std::vector<uint32_t>& freqs, std::vector<uint32_t>& starts
         starts[i + 1] = starts[i] + freqs[i];
     }
 }
+template <typename IntType>
+void print_histogrami(const std::vector<IntType>& data, const std::string& title, int num_bins = 20)
+{
+    static_assert(std::is_integral_v<IntType>, "print_histogram requires an integer type");
+
+    if (data.empty()) {
+        printf("Histogram: '%s' (No data)\n", title.c_str());
+        return;
+    }
+
+    // 1. Find min and max
+    IntType min_val = data[0];
+    IntType max_val = data[0];
+    for (auto val : data) {
+        if (val < min_val) min_val = val;
+        if (val > max_val) max_val = val;
+    }
+
+    printf("\n--- Histogram: %s ---\n", title.c_str());
+    printf("Total points: %zu\n", data.size());
+    printf("Min: %lld, Max: %lld\n",
+        (long long)min_val, (long long)max_val);
+
+    if (min_val == max_val) {
+        printf("[%lld] count: %zu\n", (long long)min_val, data.size());
+        return;
+    }
+
+    // 2. Determine bin size
+    double range = double(max_val) - double(min_val);
+    double bin_size = range / num_bins;
+
+    if (bin_size < 1.0) {
+        bin_size = 1.0;
+        num_bins = int(range) + 1;
+        if (num_bins > 100) {
+            num_bins = 100;
+            bin_size = range / num_bins;
+        }
+    }
+
+    // 3. Populate bins
+    std::vector<long long> bin_counts(num_bins, 0);
+    long long max_count = 0;
+
+    for (auto val : data) {
+        int bin_index = int((double(val) - double(min_val)) / bin_size);
+        if (bin_index >= num_bins) bin_index = num_bins - 1;
+        if (bin_index < 0) bin_index = 0;
+        bin_counts[bin_index]++;
+        if (bin_counts[bin_index] > max_count)
+            max_count = bin_counts[bin_index];
+    }
+
+    // 4. Print histogram
+    const int max_bar_width = 50;
+
+    printf("%-25s | %-10s | %s\n", "Bin Range", "Count", "Bar");
+    printf("%s\n", std::string(25 + 13 + max_bar_width, '-').c_str());
+
+    for (int i = 0; i < num_bins; ++i) {
+        long long bin_start = (long long)min_val + (long long)(i * bin_size);
+        long long bin_end = (long long)min_val + (long long)((i + 1) * bin_size);
+
+        char range_str[128];
+
+        if (i == num_bins - 1)
+            snprintf(range_str, sizeof(range_str), "[%lld, %lld]",
+                bin_start, (long long)max_val);
+        else
+            snprintf(range_str, sizeof(range_str), "[%lld, %lld)",
+                bin_start, bin_end);
+
+        long long count = bin_counts[i];
+        int bar_width = (max_count > 0)
+            ? int((double(count) / max_count) * max_bar_width)
+            : 0;
+
+        std::string bar(bar_width, '#');
+
+        printf("%-25s | %-10lld | %s\n", range_str, count, bar.c_str());
+    }
+
+    printf("---------------------------------\n");
+}
+
+
+template <typename IntType>
+__host__ __device__
+int bits_required(IntType v)
+{
+    using U = std::make_unsigned_t<IntType>;
+    U x = static_cast<U>(v);
+
+    if (x == 0) return 1;
+
+#if defined(__CUDA_ARCH__)
+    // Running on GPU device
+    if constexpr (sizeof(U) <= 4) {
+        return 32 - __clz((unsigned int)x);
+    }
+    else {
+        return 64 - __clzll((unsigned long long)x);
+    }
+#else
+    // Running on CPU host (fallback)
+    int bits = 0;
+    while (x) {
+        x >>= 1;
+        bits++;
+    }
+    return bits;
+#endif
+}
+template <typename IntType>
+int compute_min_bits_required(const std::vector<IntType>& data)
+{
+    using U = std::make_unsigned_t<IntType>;
+    int bits = 0;
+    for (U x : data) {
+
+
+#if defined(__CUDA_ARCH__)
+        // GPU fast path
+        if constexpr (sizeof(U) <= 4)
+            return 32 - __clz((unsigned)x);
+        else
+            return 64 - __clzll((unsigned long long)x);
+#else
+        // CPU fallback
+
+        while (x) {
+            x >>= 1;
+            bits++;
+        }
+
+#endif
+    }
+    return bits;
+}
 
 int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     if (data.empty()) return 0;
-    //printf("[%s] size: %.2f MB \n",name, double (data.size() * 4)/1024/1024);
+    printf("[%s] size: %.2f MB \n",name, double (data.size() * 4)/1024/1024);
     size_t n = data.size();
 
     // 1. Buffers for Splitting
@@ -506,30 +645,51 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     gpuErrchk(cudaMalloc(&d_raw, n * 4));
 
     gpuErrchk(cudaMemcpy(d_in, data.data(), n * 4, cudaMemcpyHostToDevice));
-
+    int sym_per_thread = 64;
     int blockSize = 256;
+
     int numBlocks = (n + blockSize - 1) / blockSize;
     k_split_integers << <numBlocks, blockSize >> > (d_in, d_k, d_sym, d_raw, n);
     gpuErrchk(cudaDeviceSynchronize());
-
+    
     // 2. Frequency Analysis (Host)
     std::vector<uint8_t> h_k(n);
     std::vector<uint8_t> h_sym(n);
+    std::vector<uint8_t> h_raw(n);
     gpuErrchk(cudaMemcpy(h_k.data(), d_k, n, cudaMemcpyDeviceToHost));
     gpuErrchk(cudaMemcpy(h_sym.data(), d_sym, n, cudaMemcpyDeviceToHost));
+    gpuErrchk(cudaMemcpy(h_raw.data(), d_raw, n, cudaMemcpyDeviceToHost));
+    print_histogrami(h_sym, "k data");
+    print_histogrami(h_raw, "raw data");
+    std::vector<std::vector<uint32_t>>all_freq_k;
+    std::vector<std::vector<uint32_t>>all_freq_sym;
+    std::vector<std::vector<uint32_t>>all_start_k;
+    std::vector<std::vector<uint32_t>>all_start_sym;
+    std::vector<std::vector<uint8_t>>all_look_k;
+    std::vector<std::vector<uint8_t>>all_look_sym;
+    for (int i = 0; i < numBlocks; i++) {
+        std::vector<uint32_t> freq_k(33, 1);
+        std::vector<uint32_t> freq_sym(256, 1);
+        for (int x = 0; x < sym_per_thread; x++) freq_k[h_k[x]]++;
+        for (int x = 0; x < sym_per_thread; x++) freq_sym[h_sym[x]]++;
 
-    std::vector<uint32_t> freq_k(33, 0);
-    std::vector<uint32_t> freq_sym(256, 0);
-    for (auto x : h_k) freq_k[x]++;
-    for (auto x : h_sym) freq_sym[x]++;
+        std::vector<uint32_t> start_k(34), start_sym(257);
+        normalize_freqs(freq_k, start_k);
+        normalize_freqs(freq_sym, start_sym);
 
-    std::vector<uint32_t> start_k(34), start_sym(257);
-    normalize_freqs(freq_k, start_k);
-    normalize_freqs(freq_sym, start_sym);
-
-    std::vector<uint8_t> lut_k(PROB_SCALE), lut_sym(PROB_SCALE);
-    build_lookup(lut_k.data(), start_k.data(), freq_k.data(), 33);
-    build_lookup(lut_sym.data(), start_sym.data(), freq_sym.data(), 256);
+        std::vector<uint8_t> lut_k(PROB_SCALE), lut_sym(PROB_SCALE);
+        build_lookup(lut_k.data(), start_k.data(), freq_k.data(), 33);
+        build_lookup(lut_sym.data(), start_sym.data(), freq_sym.data(), 256);
+        all_start_k.push_back(start_k);
+        all_start_sym.push_back(start_sym);
+        all_freq_k.push_back(freq_k);
+        all_freq_sym.push_back(freq_sym);
+        all_look_k.push_back(lut_k);
+        all_look_sym.push_back(lut_sym);
+    }
+    uint64_t perfect_pack = compute_min_bits_required(h_k) + compute_min_bits_required(h_raw);
+       printf("number of bits if packed ideally: %u \n", perfect_pack);
+       printf("number of mb if packed ideally: %u \n", perfect_pack/8/1024/1024);
 
     // 3. Tables to GPU
     DeviceTables tables;
@@ -540,15 +700,15 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     gpuErrchk(cudaMalloc(&tables.enc_freq_sym, 256 * 4));
     gpuErrchk(cudaMalloc(&tables.enc_start_sym, 256 * 4));
 
-    gpuErrchk(cudaMemcpy(tables.lookup_k, lut_k.data(), PROB_SCALE, cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tables.lookup_sym, lut_sym.data(), PROB_SCALE, cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tables.enc_freq_k, freq_k.data(), 33 * 4, cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tables.enc_start_k, start_k.data(), 33 * 4, cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tables.enc_freq_sym, freq_sym.data(), 256 * 4, cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tables.enc_start_sym, start_sym.data(), 256 * 4, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.lookup_k, all_look_k[0].data(), PROB_SCALE, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.lookup_sym, all_look_sym[0].data(), PROB_SCALE, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.enc_freq_k, all_freq_k[0].data(), 33 * 4, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.enc_start_k, all_start_k[0].data(), 33 * 4, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.enc_freq_sym, all_freq_sym[0].data(), 256 * 4, cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(tables.enc_start_sym, all_start_sym[0].data(), 256 * 4, cudaMemcpyHostToDevice));
 
     // 4. Encode
-    int sym_per_thread = 2048;
+    
     size_t total_syms = ((n + sym_per_thread - 1) / sym_per_thread) * sym_per_thread;
     int enc_threads = total_syms / sym_per_thread;
     int enc_blocks = (enc_threads + 255) / 256;
@@ -573,7 +733,7 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    //printf("[%s] Encode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
+    printf("[%s] Encode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
     // 5. Compaction (Scan + Gather)
 
     // A. Prefix Sum (Scan) on Sizes
@@ -601,7 +761,7 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
         );
     gpuErrchk(cudaDeviceSynchronize());
 
-    //printf("[%s] Encoded Size: %.2f MB\n", name, (double)total_compressed / 1024 / 1024);
+    printf("[%s] Encoded Size: %.2f MB\n", name, (double)total_compressed / 1024 / 1024);
 
     // 6. Decode
     int32_t* d_decoded;
@@ -624,7 +784,7 @@ int compress_stream_gpu(const std::vector<int32_t>& data, const char* name) {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&ms, start, stop);
 
-    //printf("[%s] Decode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
+    printf("[%s] Decode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n * 4) / (ms / 1000.0) / 1024 / 1024);
 
     // Verify
     std::vector<int32_t> h_verify(n);
@@ -692,7 +852,7 @@ int compress_stream_gpu(const std::vector<int8_t>& data, const char* name) {
     gpuErrchk(cudaMemcpy(tables.enc_start_sym, start_sym.data(), 256 * 4, cudaMemcpyHostToDevice));
 
     // 4. Encode
-    int sym_per_thread = 2048;
+    int sym_per_thread = 64;
     size_t total_syms = ((n + sym_per_thread - 1) / sym_per_thread) * sym_per_thread;
     int enc_threads = total_syms / sym_per_thread;
     int enc_blocks = (enc_threads + 255) / 256;
@@ -723,7 +883,7 @@ int compress_stream_gpu(const std::vector<int8_t>& data, const char* name) {
 
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    //printf("[%s] Encode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n) / (ms / 1000.0) / 1024 / 1024);
+    printf("[%s] Encode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n) / (ms / 1000.0) / 1024 / 1024);
 
     // 5. Compaction (Scan + Gather)
     uint32_t* d_dec_offsets;
@@ -749,7 +909,7 @@ int compress_stream_gpu(const std::vector<int8_t>& data, const char* name) {
         );
     gpuErrchk(cudaDeviceSynchronize());
 
-    //printf("[%s] Encoded Size: %.2f MB (Ratio: %.2f:1)\n", name, (double)total_compressed / 1024 / 1024, (double)n / total_compressed);
+    printf("[%s] Encoded Size: %.2f MB (Ratio: %.2f:1)\n", name, (double)total_compressed / 1024 / 1024, (double)n / total_compressed);
 
     // 6. Decode
     int8_t* d_decoded;
@@ -766,7 +926,7 @@ int compress_stream_gpu(const std::vector<int8_t>& data, const char* name) {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&ms, start, stop);
 
-    //printf("[%s] Decode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n) / (ms / 1000.0) / 1024 / 1024);
+    printf("[%s] Decode Time: %.3f ms. Throughput: %.2f MB/s\n", name, ms, (double)(n) / (ms / 1000.0) / 1024 / 1024);
 
     // Verify
     std::vector<int8_t> h_verify(n);
