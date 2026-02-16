@@ -252,7 +252,7 @@ struct k_code {
     std::vector<uint32_t> raw_bits;
 };
 
-int getheader(string filename) {
+int getheader(string filename, laszip_U32 num_chunks = 0, laszip_I64* starts = NULL) {
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
     laszip_point* laz_point = nullptr;
@@ -283,8 +283,7 @@ int getheader(string filename) {
     }
 
     laszip_seek_point(laszip_reader, 0);
-    laszip_U32 num_chunks = 0;
-    laszip_I64* starts = NULL;
+
 
     if (laszip_get_chunk_starts(laszip_reader, &num_chunks, &starts) != 0) {
         laszip_CHAR* err = NULL;
@@ -311,7 +310,9 @@ int getheader(string filename) {
 int main()
 {
     string file = "./resources/pointclouds/chunked.laz";
-	getheader(file.c_str());
+    laszip_U32 num_chunks = 0;
+    laszip_I64* starts = NULL;
+	getheader(file.c_str(), num_chunks, starts);
     
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
