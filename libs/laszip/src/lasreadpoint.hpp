@@ -66,7 +66,11 @@ public:
   BOOL read(U8* const * point);
   BOOL check_end();
   BOOL done();
+  // Number of chunk starts currently available (tabled)
+  inline U32 get_num_chunk_starts() const { return tabled_chunks; }
 
+  // Pointer to the internal array of absolute offsets (length = tabled_chunks)
+  inline const I64* get_chunk_starts_ptr() const { return chunk_starts; }
   inline const CHAR* error() const { return last_error; };
   inline const CHAR* warning() const { return last_warning; };
 

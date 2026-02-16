@@ -24,10 +24,12 @@
 
 // Include LASzip API header
 #include "laszip/laszip_api.h"
+
 // Include the header for the compression test function
 #include "ans.cuh"
 #include "dietans.cuh"
 #include "simple_coding.cuh"
+#include "lazgpu.cuh"
 using namespace std;
 
 /**
@@ -65,6 +67,15 @@ vector<vector<uint8_t>> int32_to_bytes_split(const vector<int32_t>& input) {
     }
     return output;
 }
+
+#include "laszip/laszip_api.h"
+#include <vector>
+#include <string>
+#include <fstream>
+#include <iostream>
+
+
+
 
 template <typename T>
 void compress_chunked(const std::vector<T>& data, const char* name, size_t chunk_size = 65536) {
@@ -241,15 +252,7 @@ struct k_code {
     std::vector<uint32_t> raw_bits;
 };
 
-/**
- * Maps the signed delta 'c' to a positive value for the encoder,
- * based on the 'k' found, as per LAZ spec 10.5.5 .
- */
-
-int main()
-{
-    string file = "./resources/pointclouds/large.laz";
-
+int getheader(string filename) {
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
     laszip_point* laz_point = nullptr;
@@ -265,12 +268,76 @@ int main()
 
     laszip_request_compatibility_mode(laszip_reader, request_reader);
 
+    if (laszip_open_reader(laszip_reader, filename.c_str(), &is_compressed) != 0) {
+        std::println(stderr, "Failed to open {}", filename);
+        laszip_destroy(laszip_reader);
+        return 1;
+    }
+
+    laszip_get_header_pointer(laszip_reader, &lazHeader);
+    if (!lazHeader) {
+        std::println(stderr, "Failed to get LAS header.");
+        laszip_close_reader(laszip_reader);
+        laszip_destroy(laszip_reader);
+        return 1;
+    }
+
+    laszip_seek_point(laszip_reader, 0);
+    laszip_U32 num_chunks = 0;
+    laszip_I64* starts = NULL;
+
+    if (laszip_get_chunk_starts(laszip_reader, &num_chunks, &starts) != 0) {
+        laszip_CHAR* err = NULL;
+        laszip_get_error(laszip_reader, &err);
+        fprintf(stderr, "Error: %s\n", err);
+    }
+
+    for (laszip_U32 i = 0; i < num_chunks; ++i) {
+        printf("chunk %u starts at %lld\n", i, (long long)starts[i]);
+    }
+   
+
+
+    return 0;
+}
+
+
+
+/**
+ * Maps the signed delta 'c' to a positive value for the encoder,
+ * based on the 'k' found, as per LAZ spec 10.5.5 .
+ */
+
+int main()
+{
+    string file = "./resources/pointclouds/chunked.laz";
+	getheader(file.c_str());
+    
+    laszip_POINTER laszip_reader = nullptr;
+    laszip_header* lazHeader = nullptr;
+    laszip_point* laz_point = nullptr;
+
+    laszip_create(&laszip_reader);
+    if (!laszip_reader) {
+        std::println(stderr, "Failed to create laszip reader.");
+        return 1;
+    }
+    
+    laszip_BOOL is_compressed;
+    laszip_BOOL request_reader = true;
+
+    laszip_request_compatibility_mode(laszip_reader, request_reader);
+
     if (laszip_open_reader(laszip_reader, file.c_str(), &is_compressed) != 0) {
         std::println(stderr, "Failed to open {}", file);
         laszip_destroy(laszip_reader);
         return 1;
     }
-
+    laszip_U8 version_major;
+    laszip_U8 version_minor;
+    laszip_U16 revision;
+    laszip_U32 build;
+	laszip_get_version(&version_major, &version_minor, &revision, &build);
     laszip_get_header_pointer(laszip_reader, &lazHeader);
     if (!lazHeader) {
         std::println(stderr, "Failed to get LAS header.");

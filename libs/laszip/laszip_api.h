@@ -607,6 +607,13 @@ laszip_open_writer_stream(
     , laszip_BOOL                      do_not_write_header
 );
 
+LASZIP_API laszip_I32
+laszip_get_chunk_starts(
+    laszip_POINTER                     pointer
+    , laszip_U32* num_chunks
+    , laszip_I64** starts_out
+);
+
 /*---------------------------------------------------------------------------*/
 // make LASzip VLR for point type and point size already specified earlier
 LASZIP_API laszip_I32

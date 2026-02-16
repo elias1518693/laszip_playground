@@ -4921,6 +4921,65 @@ laszip_open_writer_stream(
   return 0;
 }
 
+
+LASZIP_API laszip_I32
+laszip_get_chunk_starts(
+    laszip_POINTER                     pointer
+    , laszip_U32* num_chunks
+    , laszip_I64** starts_out
+)
+{
+    if (pointer == 0) return 1;
+    laszip_dll_struct* laszip_dll = (laszip_dll_struct*)pointer;
+
+    try
+    {
+        if (num_chunks == 0 || starts_out == 0)
+        {
+            sprintf(laszip_dll->error, "laszip_get_chunk_starts: output pointers are zero");
+            return 1;
+        }
+
+        *num_chunks = 0;
+        *starts_out = 0;
+
+        if (laszip_dll->reader == 0)
+        {
+            sprintf(laszip_dll->error, "laszip_get_chunk_starts: reader is not open");
+            return 1;
+        }
+
+        const U32 n = laszip_dll->reader->get_num_chunk_starts();
+        const I64* src = laszip_dll->reader->get_chunk_starts_ptr();
+
+        if (n == 0 || src == 0)
+        {
+            // OK but empty (unchunked file or decoder not initialized yet)
+            return 0;
+        }
+
+        laszip_I64* buf = (laszip_I64*)malloc(sizeof(laszip_I64) * n);
+        if (!buf)
+        {
+            sprintf(laszip_dll->error, "laszip_get_chunk_starts: cannot allocate %u entries", n);
+            return 1;
+        }
+
+        for (U32 i = 0; i < n; ++i) buf[i] = (laszip_I64)src[i];
+
+        *num_chunks = n;
+        *starts_out = buf;
+    }
+    catch (...)
+    {
+        sprintf(laszip_dll->error, "internal error in laszip_get_chunk_starts");
+        return 1;
+    }
+
+    laszip_dll->error[0] = '\0';
+    return 0;
+}
+
 /*---------------------------------------------------------------------------*/
 // creates complete LASzip VLR for currently selected point type and compression
 // The VLR data is valid until the laszip_dll pointer is destroyed.
