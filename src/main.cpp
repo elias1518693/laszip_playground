@@ -252,28 +252,64 @@ struct k_code {
     std::vector<uint32_t> raw_bits;
 };
 
-int getheader(string filename, laszip_U32 num_chunks = 0, laszip_I64* starts = NULL) {
-    laszip_POINTER laszip_reader = nullptr;
-    laszip_header* lazHeader = nullptr;
-    laszip_point* laz_point = nullptr;
-
-    laszip_create(&laszip_reader);
-    if (!laszip_reader) {
-        std::println(stderr, "Failed to create laszip reader.");
+int load_laz_for_gpu(const std::string& filename,
+    std::vector<uint8_t>& raw_file_data,
+    uint32_t& num_chunks,
+    std::vector<uint64_t>& chunk_offsets,
+    uint64_t& actual_total_points)
+{
+    // 1. Load the raw file bytes into memory for the GPU
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for binary reading.\n";
         return 1;
     }
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    raw_file_data.resize(size);
+    if (!file.read(reinterpret_cast<char*>(raw_file_data.data()), size)) {
+        std::cerr << "Failed to read file data.\n";
+        return 1;
+    }
+    file.close();
+
+    // 2. Use LASzip API purely to parse the chunk table
+    laszip_POINTER laszip_reader = nullptr;
+    laszip_create(&laszip_reader);
 
     laszip_BOOL is_compressed;
-    laszip_BOOL request_reader = true;
-
-    laszip_request_compatibility_mode(laszip_reader, request_reader);
+    laszip_request_compatibility_mode(laszip_reader, true);
 
     if (laszip_open_reader(laszip_reader, filename.c_str(), &is_compressed) != 0) {
-        std::println(stderr, "Failed to open {}", filename);
+        std::cerr << "Failed to open LASzip reader.\n";
         laszip_destroy(laszip_reader);
         return 1;
     }
 
+    // You must seek to 0 to force the reader to initialize the chunk table
+    laszip_seek_point(laszip_reader, 0);
+
+    laszip_U32 internal_num_chunks = 0;
+    laszip_I64* internal_starts = nullptr;
+
+    if (laszip_get_chunk_starts(laszip_reader, &internal_num_chunks, &internal_starts) != 0) {
+        laszip_CHAR* err = nullptr;
+        laszip_get_error(laszip_reader, &err);
+        std::cerr << "Error getting chunks: " << err << "\n";
+        laszip_close_reader(laszip_reader);
+        laszip_destroy(laszip_reader);
+        return 1;
+    }
+
+    // 3. Copy the chunk data out so it survives after we close the reader
+    num_chunks = internal_num_chunks;
+    chunk_offsets.reserve(num_chunks);
+    for (laszip_U32 i = 0; i < num_chunks; ++i) {
+        chunk_offsets.push_back(static_cast<uint64_t>(internal_starts[i]));
+        // Optional debug print:
+        // printf("Chunk %u starts at %llu\n", i, chunk_offsets.back());
+    }
+    laszip_header* lazHeader = nullptr;
     laszip_get_header_pointer(laszip_reader, &lazHeader);
     if (!lazHeader) {
         std::println(stderr, "Failed to get LAS header.");
@@ -281,21 +317,10 @@ int getheader(string filename, laszip_U32 num_chunks = 0, laszip_I64* starts = N
         laszip_destroy(laszip_reader);
         return 1;
     }
-
-    laszip_seek_point(laszip_reader, 0);
-
-
-    if (laszip_get_chunk_starts(laszip_reader, &num_chunks, &starts) != 0) {
-        laszip_CHAR* err = NULL;
-        laszip_get_error(laszip_reader, &err);
-        fprintf(stderr, "Error: %s\n", err);
-    }
-
-    for (laszip_U32 i = 0; i < num_chunks; ++i) {
-        printf("chunk %u starts at %lld\n", i, (long long)starts[i]);
-    }
-   
-
+    actual_total_points = lazHeader->number_of_point_records;
+    // Cleanup LASzip state
+    laszip_close_reader(laszip_reader);
+    laszip_destroy(laszip_reader);
 
     return 0;
 }
@@ -309,11 +334,22 @@ int getheader(string filename, laszip_U32 num_chunks = 0, laszip_I64* starts = N
 
 int main()
 {
-    string file = "./resources/pointclouds/chunked.laz";
-    laszip_U32 num_chunks = 0;
-    laszip_I64* starts = NULL;
-	getheader(file.c_str(), num_chunks, starts);
-    
+    string file = "./resources/pointclouds/small2.laz";
+    std::vector<uint8_t> raw_file_data;
+    uint32_t num_chunks = 0;
+    std::vector<uint64_t> chunk_offsets;
+    uint64_t actual_total_points;
+    // 1. Parse chunk table and load file into RAM
+    if (load_laz_for_gpu(file, raw_file_data, num_chunks, chunk_offsets, actual_total_points) != 0) {
+        std::cerr << "Initialization failed.\n";
+        return 1;
+    }
+
+    std::cout << "Successfully loaded " << raw_file_data.size() << " bytes.\n";
+    std::cout << "Found " << num_chunks << " chunks.\n";
+   
+    // 2. Launch the CUDA wrapper
+    decompress(raw_file_data, num_chunks, chunk_offsets, actual_total_points);
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
     laszip_point* laz_point = nullptr;
@@ -450,7 +486,14 @@ int main()
             std::println(stderr, "Warning: Error reading point {}. Stopping.", i);
             break;
         }
-
+        if(i < 10)
+        std::cout << "Point " << i << ": "
+            << "X=" << laz_point->X << ", "
+            << "Y=" << laz_point->Y << ", "
+            << "Z=" << laz_point->Z << " | "
+            << "Int=" << laz_point->intensity << " | "
+            << "Class=" << (int)laz_point->classification << " | "
+            << "RGB=(" << laz_point->rgb[0] << "," << laz_point->rgb[1] << "," << laz_point->rgb[2] << ")\n";
         int32_t X = laz_point->X;
         int32_t Y = laz_point->Y;
         int32_t Z = laz_point->Z;
@@ -545,48 +588,5 @@ int main()
     // Always destroy the reader
     if (laszip_reader) {
         laszip_destroy(laszip_reader);
-    }
-
-    // --- Print Histograms ---
-    std::vector<vector<uint8_t>> dataX = int32_to_bytes_split(corrected_deltaX);
-    // --- Print Histograms ---
-    
-    print_histogram(corrected_deltaX, "Delta X");
-    print_histogram(corrected_deltaY, "Delta Y");
-    print_histogram(corrected_deltaZ, "Delta Z");
-    print_histogram(stream_dIntensity, "Intensity");
-    print_histogram(stream_BitByte, "BitByte");
-    print_histogram(stream_dScanAngle, "scanAngle");
-    print_histogram(stream_UserData, "UserData");
-    print_histogram(stream_dPointSource, "dPointSource");
-    
-    //print_histogram(dataX[1], "Simple Delta X (8-15)");
-    //print_histogram(dataX[2], "Simple Delta X (16-23)");
-    //print_histogram(dataX[3], "Simple Delta X (24-31)");
-    // Now, compress the *corrected* deltas
-
-    if (!corrected_deltaX.empty()) {
-        
-        /*
-        int repeat = 32;   // repeat twice = double size
-        size_t orig = corrected_deltaX.size();
-        corrected_deltaX.reserve(orig* repeat);
-
-        for (int i = 1; i < repeat; i++)
-            corrected_deltaX.insert(corrected_deltaX.end(),
-                corrected_deltaX.begin(),
-                corrected_deltaX.begin() + orig);
-        std::println("Compressing X deltas ({} bytes)...", corrected_deltaX.size());
-        */
-        compress_stream_aatrox(corrected_deltaX, "dX Stream"); // Assuming test() is your compression function
-        compress_stream_aatrox(corrected_deltaY, "dY Stream");
-        compress_stream_aatrox(corrected_deltaZ, "dZ Stream");
-        compress_stream_aatrox(stream_dIntensity, "dIntensity");
-        //compress_stream_aatrox(stream_BitByte, "BitByte");
-        //compress_stream_aatrox(stream_Classification, "Classification");
-        compress_stream_aatrox(stream_dScanAngle, "dScanAngle");
-        //compress_stream_aatrox(stream_UserData, "UserData");
-        compress_stream_aatrox(stream_dPointSource, "dPointSource");
-        
     }
 }
