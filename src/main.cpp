@@ -334,7 +334,7 @@ int load_laz_for_gpu(const std::string& filename,
 
 int main()
 {
-    string file = "./resources/pointclouds/small2.laz";
+    string file = "./resources/pointclouds/small24.laz";
     std::vector<uint8_t> raw_file_data;
     uint32_t num_chunks = 0;
     std::vector<uint64_t> chunk_offsets;
@@ -350,6 +350,7 @@ int main()
    
     // 2. Launch the CUDA wrapper
     decompress(raw_file_data, num_chunks, chunk_offsets, actual_total_points);
+    /*
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
     laszip_point* laz_point = nullptr;
@@ -589,4 +590,5 @@ int main()
     if (laszip_reader) {
         laszip_destroy(laszip_reader);
     }
+    */
 }
