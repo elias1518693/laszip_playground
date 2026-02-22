@@ -458,7 +458,7 @@ __device__ inline int clamp255(int v) {
     if (v > 255) return 255;
     return v;
 }
-
+#define U8_FOLD(v) ((uint8_t)((v) & 0xFF))
 __global__ void laszip_format2_kernel(
     const uint8_t* __restrict__ compressed,
     const uint64_t* __restrict__ chunk_offsets,
@@ -570,91 +570,94 @@ __global__ void laszip_format2_kernel(
 
         // 4. Decode RGB12 (Table 42)
 // 4. Decode RGB12 (Table 42)
-        uint32_t rgb_changed = state.model_rgb_changed.decode(dec);
+        uint32_t sym = state.model_rgb_changed.decode(dec);
 
-        // Previous bytes
-        uint8_t prev_r_low = prev.Red & 0xFF;
-        uint8_t prev_r_high = (prev.Red >> 8) & 0xFF;
-        uint8_t prev_g_low = prev.Green & 0xFF;
-        uint8_t prev_g_high = (prev.Green >> 8) & 0xFF;
-        uint8_t prev_b_low = prev.Blue & 0xFF;
-        uint8_t prev_b_high = (prev.Blue >> 8) & 0xFF;
+        uint16_t last_r = prev.Red;
+        uint16_t last_g = prev.Green;
+        uint16_t last_b = prev.Blue;
 
-        // Red
-        uint8_t r_low = prev_r_low;
-        uint8_t r_high = prev_r_high;
-        if (rgb_changed & (1u << 0)) {
-            int dR_L = state.rgb_models[0].decode(dec);
-            r_low = (prev_r_low + dR_L + 256) % 256;
-        }
-        if (rgb_changed & (1u << 1)) {
-            int dR_H = state.rgb_models[1].decode(dec);
-            r_high = (prev_r_high + dR_H + 256) % 256;
-        }
-        int diff_r_low = (int)r_low - (int)prev_r_low;
-        int diff_r_high = (int)r_high - (int)prev_r_high;
+        uint16_t current_r, current_g, current_h;
+        uint8_t r_low, r_high;
 
-        uint8_t g_low = prev_g_low;
-        uint8_t g_high = prev_g_high;
-        uint8_t b_low = prev_b_low;
-        uint8_t b_high = prev_b_high;
-
-        if (rgb_changed & (1u << 6)) {
-            // Bit 6 is SET: UNCORRELATED DECODING
-            // Do not use predictions, but you MUST decode the differences
-            if (rgb_changed & (1u << 2)) {
-                g_low = (prev_g_low + state.rgb_models[2].decode(dec) + 256) % 256;
-            }
-            if (rgb_changed & (1u << 3)) {
-                g_high = (prev_g_high + state.rgb_models[3].decode(dec) + 256) % 256;
-            }
-            if (rgb_changed & (1u << 4)) {
-                b_low = (prev_b_low + state.rgb_models[4].decode(dec) + 256) % 256;
-            }
-            if (rgb_changed & (1u << 5)) {
-                b_high = (prev_b_high + state.rgb_models[5].decode(dec) + 256) % 256;
-            }
+        // 1. Decode Red
+        if (sym & (1 << 0)) {
+            uint8_t corr = (uint8_t)state.rgb_models[0].decode(dec);
+            r_low = U8_FOLD(corr + (last_r & 0xFF));
         }
         else {
-            // Bit 6 is NOT SET: CORRELATED DECODING 
-            // (Using your original, spec-compliant math)
-
-            // Green low
-            if (rgb_changed & (1u << 2)) {
-                int dG_L = state.rgb_models[2].decode(dec);
-                int base = clamp255(prev_g_low + diff_r_low);
-                g_low = (dG_L + base + 256) % 256;
-            }
-            // Green high
-            if (rgb_changed & (1u << 3)) {
-                int dG_H = state.rgb_models[3].decode(dec);
-                int base = clamp255(prev_g_high + diff_r_high);
-                g_high = (dG_H + base + 256) % 256;
-            }
-
-            // Compute actual Green diffs (needed for Blue prediction)
-            int diff_g_low = (int)g_low - (int)prev_g_low;
-            int diff_g_high = (int)g_high - (int)prev_g_high;
-
-            // Blue low
-            if (rgb_changed & (1u << 4)) {
-                int dB_L = state.rgb_models[4].decode(dec);
-                int diff_b_L_pred = (diff_r_low + diff_g_low) / 2;
-                int base = clamp255(prev_b_low + diff_b_L_pred);
-                b_low = (dB_L + base + 256) % 256;
-            }
-            // Blue high
-            if (rgb_changed & (1u << 5)) {
-                int dB_H = state.rgb_models[5].decode(dec);
-                int diff_b_H_pred = (diff_r_high + diff_g_high) / 2;
-                int base = clamp255(prev_b_high + diff_b_H_pred);
-                b_high = (dB_H + base + 256) % 256;
-            }
+            r_low = last_r & 0xFF;
         }
 
-        p.Red = (uint16_t(r_high) << 8) | r_low;
-        p.Green = (uint16_t(g_high) << 8) | g_low;
-        p.Blue = (uint16_t(b_high) << 8) | b_low;
+        if (sym & (1 << 1)) {
+            uint8_t corr = (uint8_t)state.rgb_models[1].decode(dec);
+            r_high = U8_FOLD(corr + (last_r >> 8));
+        }
+        else {
+            r_high = (last_r >> 8) & 0xFF;
+        }
+
+        uint16_t final_red = (uint16_t)r_low | ((uint16_t)r_high << 8);
+
+        if (sym & (1 << 6)) {
+            // --- CORRELATED MODE (Bit 6 is SET in code) ---
+            int32_t diff;
+            uint8_t g_low, g_high, b_low, b_high;
+
+            // Process LOW bytes
+            diff = (int32_t)r_low - (int32_t)(last_r & 0xFF);
+
+            // Green Low
+            if (sym & (1 << 2)) {
+                uint8_t corr = (uint8_t)state.rgb_models[2].decode(dec);
+                g_low = U8_FOLD(corr + clamp255(diff + (last_g & 0xFF)));
+            }
+            else {
+                g_low = last_g & 0xFF;
+            }
+
+            // Blue Low
+            if (sym & (1 << 4)) {
+                uint8_t corr = (uint8_t)state.rgb_models[4].decode(dec);
+                // Re-calculate diff as average of Red and Green deltas
+                int32_t blue_diff = (diff + ((int32_t)g_low - (int32_t)(last_g & 0xFF))) / 2;
+                b_low = U8_FOLD(corr + clamp255(blue_diff + (last_b & 0xFF)));
+            }
+            else {
+                b_low = last_b & 0xFF;
+            }
+
+            // Process HIGH bytes
+            diff = (int32_t)r_high - (int32_t)(last_r >> 8);
+
+            // Green High
+            if (sym & (1 << 3)) {
+                uint8_t corr = (uint8_t)state.rgb_models[3].decode(dec);
+                g_high = U8_FOLD(corr + clamp255(diff + (last_g >> 8)));
+            }
+            else {
+                g_high = (last_g >> 8) & 0xFF;
+            }
+
+            // Blue High
+            if (sym & (1 << 5)) {
+                uint8_t corr = (uint8_t)state.rgb_models[5].decode(dec);
+                int32_t blue_diff = (diff + ((int32_t)g_high - (int32_t)(last_g >> 8))) / 2;
+                b_high = U8_FOLD(corr + clamp255(blue_diff + (last_b >> 8)));
+            }
+            else {
+                b_high = (last_b >> 8) & 0xFF;
+            }
+
+            p.Red = final_red;
+            p.Green = (uint16_t)g_low | ((uint16_t)g_high << 8);
+            p.Blue = (uint16_t)b_low | ((uint16_t)b_high << 8);
+        }
+        else {
+            // --- DUPLICATION MODE (Bit 6 is NOT SET) ---
+            p.Red = final_red;
+            p.Green = final_red;
+            p.Blue = final_red;
+        }
         out_points[base_idx + i] = p;
         prev = p;
     }
@@ -711,7 +714,7 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
         std::vector<PointFormat2> h_points(total_points);
         gpuErrchk(cudaMemcpy(h_points.data(), d_out_points, total_points * sizeof(PointFormat2), cudaMemcpyDeviceToHost));
 
-        int num_to_print = std::min(10, (int)h_points.size());
+        int num_to_print = std::min(30, (int)h_points.size());
         std::cout << "\n--- First " << num_to_print << " Points ---\n";
         for (int i = 0; i < num_to_print; i++) {
             const auto& p = h_points[i];
