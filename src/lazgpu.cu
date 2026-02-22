@@ -88,108 +88,63 @@ struct ArithmeticDecoder {
 // 2. Symbol Model (FastAC)
 // ---------------------------------------------------------------
 struct SymbolModel {
-    static const uint32_t SCALE = 1u << 15; // 32768
     uint32_t symbol_count[256];
-    uint16_t cum[257];        // cumulative, size num_symbols + 1
-    uint32_t num_symbols;
-
+    uint16_t distribution[256];
     uint32_t update_cycle;
     uint32_t symbols_until_update;
+    uint32_t num_symbols; // <-- Added dynamic bounds tracking
 
     __device__ void init(uint32_t symbols) {
         num_symbols = symbols;
-        for (uint32_t i = 0; i < num_symbols; ++i) symbol_count[i] = 1;
+        for (uint32_t i = 0; i < num_symbols; i++) symbol_count[i] = 1;
         update_cycle = (num_symbols + 6) / 2;
         symbols_until_update = update_cycle;
-        build_cum();
-    }
-
-    __device__ void rescale_counts_if_needed() {
-        // Keep counts in a reasonable range
-        uint32_t total = 0;
-        for (uint32_t i = 0; i < num_symbols; ++i) total += symbol_count[i];
-        if (total > 32768) {
-            total = 0;
-            for (uint32_t i = 0; i < num_symbols; ++i) {
-                symbol_count[i] = (symbol_count[i] >> 1) + 1;
-                total += symbol_count[i];
-            }
-        }
-    }
-
-    __device__ void build_cum() {
-        // Build cumulative from counts and scale to SCALE
-        uint32_t total = 0;
-        for (uint32_t i = 0; i < num_symbols; ++i) total += symbol_count[i];
-
-        // Guard against division by zero (should not happen with counts>=1)
-        if (total == 0) total = 1;
-
-        cum[0] = 0;
-        uint32_t run = 0;
-        for (uint32_t i = 0; i < num_symbols; ++i) {
-            uint32_t next = run + symbol_count[i];
-            // Scale cumulative to [0, SCALE]
-            uint32_t scaled = (next * SCALE) / total;
-            cum[i + 1] = (uint16_t)scaled;
-            run = next;
-        }
-
-        // Enforce strictly increasing CDF and terminal == SCALE
-        cum[num_symbols] = (uint16_t)SCALE;
-        for (uint32_t i = 1; i <= num_symbols; ++i) {
-            if (cum[i] <= cum[i - 1]) cum[i] = cum[i - 1] + 1;
-        }
-        // If we overshot, clamp terminal and fix backwards (rare)
-        if (cum[num_symbols] > SCALE) cum[num_symbols] = (uint16_t)SCALE;
-        for (int i = (int)num_symbols - 1; i >= 0; --i) {
-            if (cum[i] >= cum[i + 1]) cum[i] = cum[i + 1] - 1;
-        }
-        cum[0] = 0;
+        update_distribution();
     }
 
     __device__ void update_distribution() {
-        rescale_counts_if_needed();
-        build_cum();
+        uint32_t total_count = 0;
+        for (uint32_t i = 0; i < num_symbols; i++) total_count += symbol_count[i];
 
+        if (total_count > 32768) {
+            total_count = 0;
+            for (uint32_t i = 0; i < num_symbols; i++) {
+                symbol_count[i] = (symbol_count[i] >> 1) + 1;
+                total_count += symbol_count[i];
+            }
+        }
+
+        uint32_t sum = 0;
+        uint32_t scale = 0x80000000U / total_count;
+        for (uint32_t i = 0; i < num_symbols; i++) {
+            distribution[i] = (uint16_t)((scale * sum) >> 16);
+            sum += symbol_count[i];
+        }
         update_cycle += (update_cycle >> 2);
         if (update_cycle > 8 * (num_symbols + 6)) update_cycle = 8 * (num_symbols + 6);
         symbols_until_update = update_cycle;
     }
 
     __device__ uint32_t decode(ArithmeticDecoder& dec) {
-        // Map value to [0, SCALE)
-        uint32_t ltmp = dec.length >> 15;              // length / SCALE
-        uint32_t scaled = dec.value / ltmp;            // in [0, SCALE)
-
-        // Find s s.t. cum[s] <= scaled < cum[s+1]
-        // Linear scan is fine for 128/256 symbols; replace with binary search if needed.
-        uint32_t s = 0;
-        // Optional: binary search for speed
-        uint32_t lo = 0, hi = num_symbols;
-        while (lo + 1 < hi) {
-            uint32_t mid = (lo + hi) >> 1;
-            if (cum[mid] <= scaled) lo = mid;
-            else hi = mid;
+        uint32_t ltmp = dec.length >> 15;
+        uint32_t sym = 0;
+        for (int s = num_symbols - 1; s >= 0; s--) {
+            if ((uint32_t)distribution[s] * ltmp <= dec.value) { sym = s; break; }
         }
-        s = lo;
-
-        // Interval bounds
-        uint32_t lower_c = cum[s];
-        uint32_t upper_c = cum[s + 1];
-        uint32_t lower = lower_c * ltmp;
-        uint32_t upper = upper_c * ltmp;
-
-        // Renormalize decoder state
+        uint32_t lower = (uint32_t)distribution[sym] * ltmp;
         dec.value -= lower;
-        dec.length = upper - lower;
+
+        if (sym < num_symbols - 1) {
+            dec.length = ((uint32_t)distribution[sym + 1] * ltmp) - lower;
+        }
+        else {
+            dec.length -= lower;
+        }
         dec.renorm();
 
-        // Adapt model
-        symbol_count[s]++;
+        symbol_count[sym]++;
         if (--symbols_until_update == 0) update_distribution();
-
-        return s;
+        return sym;
     }
 };
 
@@ -397,34 +352,60 @@ struct ChunkState {
 
 struct StreamingMedian5 {
     int32_t values[5];
-    int index;
+    bool remove_largest; // State tracking for the removal rule
 
     __device__ void init() {
         for (int i = 0; i < 5; i++) values[i] = 0;
-        index = 0;
+        remove_largest = true; // First insertion always removes largest
     }
 
     __device__ void add(int32_t v) {
-        values[index] = v;
-        index = (index + 1) % 5; // ring buffer
+        // 1. Sort current values to find current median and min/max
+        // Using a simple insertion sort logic for in-place maintenance
+        sort_internal();
+
+        int32_t current_median = values[2];
+
+        // 2. Determine index to replace
+        int replace_idx = remove_largest ? 4 : 0;
+
+        // 3. Update the value
+        values[replace_idx] = v;
+
+        // 4. Update the state for the NEXT insertion
+        bool current_was_largest = remove_largest;
+
+        if (v < current_median) {
+            remove_largest = true;
+        }
+        else if (v > current_median) {
+            remove_largest = false;
+        }
+        else {
+            // Rule: "removes the opposite of the current insertion"
+            remove_largest = !current_was_largest;
+        }
+
+        // 5. Re-sort so get() is always O(1) and indices are predictable
+        sort_internal();
     }
 
     __device__ int32_t get() const {
-        // Quick 5-element median sorting network
-        int32_t v[5];
-        for (int i = 0; i < 5; i++) v[i] = values[i];
+        return values[2]; // Return the 3rd ordered value
+    }
 
-        // Bubble sort (safe for N=5 in CUDA registers)
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4 - i; ++j) {
-                if (v[j] > v[j + 1]) {
-                    int32_t tmp = v[j];
-                    v[j] = v[j + 1];
-                    v[j + 1] = tmp;
+private:
+    __device__ void sort_internal() {
+        // Optimized Bubble Sort for 5 elements
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4 - i; j++) {
+                if (values[j] > values[j + 1]) {
+                    int32_t tmp = values[j];
+                    values[j] = values[j + 1];
+                    values[j + 1] = tmp;
                 }
             }
         }
-        return v[2]; // Return the middle (median) value
     }
 };
 // ---------------------------------------------------------------
@@ -565,15 +546,19 @@ __global__ void laszip_format2_kernel(
         // X Coordinate
         int ctx_x = (n == 1) ? 1 : 0;
         int32_t dx = state.model_X[ctx_x].decode(dec, k_x);
-        p.X = prev.X + median_X[m].get() + dx;
-        median_X[m].add(dx);
-
+        int32_t dxMedian = median_X[m].get() + dx;
+        p.X = ISum32(prev.X, dxMedian);
+        median_X[m].add(dxMedian);
+        if (chunk_id == 0 && threadIdx.x == 0) {
+           // printf("%u point has return: %u \n", i, m);
+        }
         // Y Coordinate
         int ctx_y = (k_x < 20) ? (k_x & ~1) : 20;
         if (n == 1) ctx_y += 1;
         int32_t dy = state.model_Y[ctx_y].decode(dec, k_y);
-        p.Y = prev.Y + median_Y[m].get() + dy;
-        median_Y[m].add(dy);
+        int32_t dyMedian = median_Y[m].get() + dy;
+        p.Y = ISum32(prev.Y, dyMedian);
+        median_Y[m].add(dyMedian);
 
         // Z Coordinate (NO MEDIAN)
         int kXY = (k_x + k_y) / 2;
@@ -615,11 +600,25 @@ __global__ void laszip_format2_kernel(
         uint8_t b_high = prev_b_high;
 
         if (rgb_changed & (1u << 6)) {
-            // G and B identical to the newly computed R
-            g_low = r_low; g_high = r_high;
-            b_low = r_low; b_high = r_high;
+            // Bit 6 is SET: UNCORRELATED DECODING
+            // Do not use predictions, but you MUST decode the differences
+            if (rgb_changed & (1u << 2)) {
+                g_low = (prev_g_low + state.rgb_models[2].decode(dec) + 256) % 256;
+            }
+            if (rgb_changed & (1u << 3)) {
+                g_high = (prev_g_high + state.rgb_models[3].decode(dec) + 256) % 256;
+            }
+            if (rgb_changed & (1u << 4)) {
+                b_low = (prev_b_low + state.rgb_models[4].decode(dec) + 256) % 256;
+            }
+            if (rgb_changed & (1u << 5)) {
+                b_high = (prev_b_high + state.rgb_models[5].decode(dec) + 256) % 256;
+            }
         }
         else {
+            // Bit 6 is NOT SET: CORRELATED DECODING 
+            // (Using your original, spec-compliant math)
+
             // Green low
             if (rgb_changed & (1u << 2)) {
                 int dG_L = state.rgb_models[2].decode(dec);
@@ -640,14 +639,14 @@ __global__ void laszip_format2_kernel(
             // Blue low
             if (rgb_changed & (1u << 4)) {
                 int dB_L = state.rgb_models[4].decode(dec);
-                int diff_b_L_pred = (diff_r_low + diff_g_low) / 2; // round toward 0 in C/C++
+                int diff_b_L_pred = (diff_r_low + diff_g_low) / 2;
                 int base = clamp255(prev_b_low + diff_b_L_pred);
                 b_low = (dB_L + base + 256) % 256;
             }
             // Blue high
             if (rgb_changed & (1u << 5)) {
                 int dB_H = state.rgb_models[5].decode(dec);
-                int diff_b_H_pred = (diff_r_high + diff_g_high) / 2; // round toward 0
+                int diff_b_H_pred = (diff_r_high + diff_g_high) / 2;
                 int base = clamp255(prev_b_high + diff_b_H_pred);
                 b_high = (dB_H + base + 256) % 256;
             }
@@ -656,53 +655,6 @@ __global__ void laszip_format2_kernel(
         p.Red = (uint16_t(r_high) << 8) | r_low;
         p.Green = (uint16_t(g_high) << 8) | g_low;
         p.Blue = (uint16_t(b_high) << 8) | b_low;
-        if (chunk_id == 0 && i < 5) {
-            // Build a small bit string for changed bits 0..6
-            unsigned c = rgb_changed;
-            printf("RGB12 DBG pt=%d rgb_changed=0x%02x bits=[%d%d%d%d%d%d%d]\n",
-                i, (unsigned)(c & 0x7F),
-                (c >> 6) & 1, (c >> 5) & 1, (c >> 4) & 1, (c >> 3) & 1, (c >> 2) & 1, (c >> 1) & 1, (c >> 0) & 1);
-
-            printf("  prev  R(l,h)=(%3d,%3d)  G(l,h)=(%3d,%3d)  B(l,h)=(%3d,%3d)\n",
-                (int)prev_r_low, (int)prev_r_high,
-                (int)prev_g_low, (int)prev_g_high,
-                (int)prev_b_low, (int)prev_b_high);
-
-            // Print Red results and diffs
-            printf("  R     r_low=%3d r_high=%3d  diff_r(l,h)=(%4d,%4d)\n",
-                (int)r_low, (int)r_high, (int)diff_r_low, (int)diff_r_high);
-
-            if (rgb_changed & (1u << 6)) {
-                printf("  G/B   bit6 set -> G=B=R  g(l,h)=(%3d,%3d) b(l,h)=(%3d,%3d)\n",
-                    (int)g_low, (int)g_high, (int)b_low, (int)b_high);
-            }
-            else {
-                // Compute diffs actually used (already computed above)
-                int diff_g_low = (int)g_low - (int)prev_g_low;
-                int diff_g_high = (int)g_high - (int)prev_g_high;
-
-                // Recompute predictor bases to print them (match your code)
-                int base_g_l = clamp255((int)prev_g_low + diff_r_low);
-                int base_g_h = clamp255((int)prev_g_high + diff_r_high);
-                int pred_b_l = (diff_r_low + diff_g_low) / 2; // round toward 0
-                int pred_b_h = (diff_r_high + diff_g_high) / 2;
-                int base_b_l = clamp255((int)prev_b_low + pred_b_l);
-                int base_b_h = clamp255((int)prev_b_high + pred_b_h);
-
-                printf("  G     g_low=%3d g_high=%3d  base(l,h)=(%3d,%3d)  diff_g(l,h)=(%4d,%4d)  bits(L,H)=(%d,%d)\n",
-                    (int)g_low, (int)g_high, base_g_l, base_g_h, diff_g_low, diff_g_high,
-                    (int)((c >> 2) & 1), (int)((c >> 3) & 1));
-
-                printf("  B     b_low=%3d b_high=%3d  base(l,h)=(%3d,%3d)  pred_avg(l,h)=(%4d,%4d)  bits(L,H)=(%d,%d)\n",
-                    (int)b_low, (int)b_high, base_b_l, base_b_h, pred_b_l, pred_b_h,
-                    (int)((c >> 4) & 1), (int)((c >> 5) & 1));
-            }
-
-            printf("  RGB16 final = (%5u,%5u,%5u)\n",
-                (unsigned)(((uint16_t)r_high << 8) | r_low),
-                (unsigned)(((uint16_t)g_high << 8) | g_low),
-                (unsigned)(((uint16_t)b_high << 8) | b_low));
-        }
         out_points[base_idx + i] = p;
         prev = p;
     }
