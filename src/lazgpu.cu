@@ -92,14 +92,16 @@ struct SymbolModel {
     uint16_t distribution[256];
     uint32_t update_cycle;
     uint32_t symbols_until_update;
-    uint32_t num_symbols; // <-- Added dynamic bounds tracking
+    uint32_t num_symbols;
 
     __device__ void init(uint32_t symbols) {
         num_symbols = symbols;
         for (uint32_t i = 0; i < num_symbols; i++) symbol_count[i] = 1;
+
+        update_distribution();
+
         update_cycle = (num_symbols + 6) / 2;
         symbols_until_update = update_cycle;
-        update_distribution();
     }
 
     __device__ void update_distribution() {
@@ -230,7 +232,7 @@ struct IntegerCompressor {
         // CRITICAL FIX: Decode the 1-bit corrector!
         if (k == 0) return model_bit_0.decode(dec);
 
-        if (k == 32) return -(1 << 31);
+        if (k == 32) return INT32_MIN;
 
         int32_t c;
         if (k <= BITS_HIGH) {
@@ -514,7 +516,9 @@ __global__ void laszip_format2_kernel(
 
         // 1. Decode Changed Values (Point10)
         uint32_t changed = state.model_changed_values.decode(dec);
-
+        if (chunk_id == 0 && threadIdx.x == 0 && i < 23) {
+            //printf("Point %u has dx: %i\n", i, changed);
+        }
         // 2. Decode Point10 attributes
         if (changed & (1 << 5)) {
             // Bit-Byte Decode
@@ -535,23 +539,21 @@ __global__ void laszip_format2_kernel(
         }
         last_Intensity[m] = p.Intensity;
         if (changed & (1 << 3)) p.Classification = state.model_classification[prev.Classification].decode(dec);
-        if (changed & (1 << 2)) p.ScanAngleRank = (p.ScanAngleRank + state.model_scan_angle[(p.ReturnMask >> 6) & 1].decode(dec)) % 256;
+        if (changed & (1 << 2)) p.ScanAngleRank = U8_FOLD(p.ScanAngleRank + state.model_scan_angle[(p.ReturnMask >> 6) & 1].decode(dec));
         if (changed & (1 << 1)) p.UserData = state.model_user_data[prev.UserData].decode(dec);
-        if (changed & (1 << 0)) p.PointSourceID = ISum32(prev.PointSourceID, state.model_point_source.decode(dec));
+        if (changed & (1 << 0)) p.PointSourceID = prev.PointSourceID + state.model_point_source.decode(dec);
 
         // 3. Decode Coordinates
         int k_x, k_y, k_z;
-        int m_x = (m == 1) ? 1 : 0; // Context grouping based on return number
 
         // X Coordinate
         int ctx_x = (n == 1) ? 1 : 0;
         int32_t dx = state.model_X[ctx_x].decode(dec, k_x);
+
         int32_t dxMedian = median_X[m].get() + dx;
         p.X = ISum32(prev.X, dxMedian);
         median_X[m].add(dxMedian);
-        if (chunk_id == 0 && threadIdx.x == 0) {
-           // printf("%u point has return: %u \n", i, m);
-        }
+
         // Y Coordinate
         int ctx_y = (k_x < 20) ? (k_x & ~1) : 20;
         if (n == 1) ctx_y += 1;
@@ -563,13 +565,17 @@ __global__ void laszip_format2_kernel(
         // Z Coordinate (NO MEDIAN)
         int kXY = (k_x + k_y) / 2;
         int ctx_z = (kXY < 18) ? (kXY & ~1) : 18;
+
+        
         if (n == 1) ctx_z += 1;
+
+        if (chunk_id == 0 && threadIdx.x == 0 && i < 23)
+            printf("point %u: ctx_z: %i, kXY: %i \n", i, ctx_z, kXY);
         int32_t dz = state.model_Z[ctx_z].decode(dec, k_z);
         p.Z = last_Z[I] + dz;
         last_Z[I] = p.Z;
 
         // 4. Decode RGB12 (Table 42)
-// 4. Decode RGB12 (Table 42)
         uint32_t sym = state.model_rgb_changed.decode(dec);
 
         uint16_t last_r = prev.Red;
@@ -682,6 +688,8 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
     uint64_t* d_chunk_offsets = nullptr;
     PointFormat2* d_out_points = nullptr;
     ChunkState* d_states = nullptr;
+
+
     // Allocate Device Memory
     gpuErrchk(cudaMalloc(&d_compressed, raw_byte_size));
     gpuErrchk(cudaMalloc(&d_chunk_offsets, num_chunks * sizeof(uint64_t)));
@@ -694,7 +702,9 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
     // Kernel Configuration
     int threads_per_block = 32;
     int blocks = (num_chunks + threads_per_block - 1) / threads_per_block;
-
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+    cudaEventRecord(start);
     // Launch Kernel
     std::cout << "Launching Kernel: " << blocks << " blocks, "
         << threads_per_block << " threads/block..." << std::endl;
@@ -708,7 +718,10 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
 
     // 2nd Check: Catch asynchronous errors (e.g., memory out-of-bounds inside the kernel)
     gpuErrchk(cudaDeviceSynchronize());
-
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
     // Copy Results Back
     {
         std::vector<PointFormat2> h_points(total_points);
@@ -735,6 +748,15 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
         std::cout << "-----------------------\n\n";
     }
 
+    double pts_per_ms_kernel = (ms > 0.0f) ? (double)total_points / (double)ms : 0.0;
+    //double pts_per_ms_e2e = (ms > 0.0) ? (double)total_points / ms : 0.0;
+
+    std::cout << "Decoded " << total_points << " points\n"
+        << "Kernel time: " << ms << " ms, throughput: "
+        << pts_per_ms_kernel << " points/ms\n";
+        //<< "End-to-end time: " << ms << " ms, throughput: "
+        //<< pts_per_ms_e2e << " points/ms\n"
+        
 
     if (d_compressed) cudaFree(d_compressed);
     if (d_chunk_offsets) cudaFree(d_chunk_offsets);

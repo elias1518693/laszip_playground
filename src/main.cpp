@@ -334,7 +334,7 @@ int load_laz_for_gpu(const std::string& filename,
 
 int main()
 {
-    string file = "./resources/pointclouds/small24.laz";
+    string file = "./resources/pointclouds/test.laz";
     std::vector<uint8_t> raw_file_data;
     uint32_t num_chunks = 0;
     std::vector<uint64_t> chunk_offsets;
