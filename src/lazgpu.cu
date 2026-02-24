@@ -207,14 +207,20 @@ struct BitModel {
 // ---------------------------------------------------------------
 // 3. Integer Compressor
 // ---------------------------------------------------------------
-template<int BITS, int BITS_HIGH>
+// Add CONTEXTS to the template arguments
+template<int BITS, int CONTEXTS, int BITS_HIGH>
 struct IntegerCompressor {
-    SymbolModel model_k;
-    BitModel model_bit_0; // Added for k=0
+    // Array of contexts for 'k'
+    SymbolModel model_k[CONTEXTS];
+
+    // Shared correctors
+    BitModel model_bit_0;
     SymbolModel model_corrector[BITS + 1];
 
     __device__ void init() {
-        model_k.init(BITS + 1);
+        for (int i = 0; i < CONTEXTS; i++) {
+            model_k[i].init(BITS + 1);
+        }
         model_bit_0.init();
 
         for (int i = 1; i <= BITS_HIGH; i++) {
@@ -225,13 +231,12 @@ struct IntegerCompressor {
         }
     }
 
-    __device__ int32_t decode(ArithmeticDecoder& dec, int& out_k) {
-        int k = model_k.decode(dec);
+    // Pass the context into the decode function
+    __device__ int32_t decode(ArithmeticDecoder& dec, int context, int& out_k) {
+        int k = model_k[context].decode(dec);
         out_k = k;
 
-        // CRITICAL FIX: Decode the 1-bit corrector!
         if (k == 0) return model_bit_0.decode(dec);
-
         if (k == 32) return INT32_MIN;
 
         int32_t c;
@@ -251,9 +256,9 @@ struct IntegerCompressor {
         return c;
     }
 
-    __device__ inline int32_t decode(ArithmeticDecoder& dec) {
+    __device__ inline int32_t decode(ArithmeticDecoder& dec, int context) {
         int dummy_k;
-        return decode(dec, dummy_k);
+        return decode(dec, context, dummy_k);
     }
 };
 
@@ -273,9 +278,7 @@ struct ChunkState {
 
     // Return Number / Number of Returns (Context: Previous Return Mask)
     SymbolModel model_bit_byte[256];
-
-    // Intensity (Context: Return index 'm', up to 4 contexts)
-    IntegerCompressor<16, 8> model_intensity[4];
+ 
 
     // Classification (Context: Previous Classification)
     SymbolModel model_classification[256];
@@ -286,20 +289,16 @@ struct ChunkState {
     // User Data (Context: Previous User Data)
     SymbolModel model_user_data[256];
 
-    // Point Source ID (Single integer compressor context)
-    IntegerCompressor<16, 8> model_point_source;
 
     // -----------------------------------------------------------
     // Spatial Coordinate Models (X, Y, Z)
     // -----------------------------------------------------------
-    // X context depends on the return index 'm'
-    IntegerCompressor<32, 8> model_X[4];
+    IntegerCompressor<16, 4, 8> model_intensity;
+    IntegerCompressor<16, 1, 8> model_point_source;
 
-    // Y context depends on the number of bits (k) used to encode X (22 contexts)
-    IntegerCompressor<32, 8> model_Y[22];
-
-    // Z context depends on the bits (k) used to encode X and Y (20 contexts)
-    IntegerCompressor<32, 8> model_Z[20];
+    IntegerCompressor<32, 2, 8> model_X;
+    IntegerCompressor<32, 22, 8> model_Y;
+    IntegerCompressor<32, 20, 8> model_Z;
 
     // -----------------------------------------------------------
     // RGB12 Color Models
@@ -313,7 +312,6 @@ struct ChunkState {
     __device__ void init() {
         // Initialize Single Symbol Models
         model_changed_values.init(64);
-        model_point_source.init();
         model_rgb_changed.init(128);
 
         // Initialize Context Arrays of size 256
@@ -323,31 +321,22 @@ struct ChunkState {
             model_user_data[i].init(256);
         }
 
-        // Initialize Intensity & X Coordinates (4 contexts based on return 'm')
-        for (int i = 0; i < 4; i++) {
-            model_intensity[i].init();
-            model_X[i].init();
-        }
-
         // Initialize Scan Angle (2 contexts based on scan direction bit)
         for (int i = 0; i < 2; i++) {
             model_scan_angle[i].init(256);
         }
 
-        // Initialize Y Coordinates (22 contexts based on dX bit-length)
-        for (int i = 0; i < 22; i++) {
-            model_Y[i].init();
-        }
-
-        // Initialize Z Coordinates (20 contexts based on dX and dY bit-lengths)
-        for (int i = 0; i < 20; i++) {
-            model_Z[i].init();
-        }
 
         // Initialize the 6 byte-based models for RGB channels
         for (int i = 0; i < 6; i++) {
             rgb_models[i].init(256);
         }
+
+        model_point_source.init();
+        model_intensity.init();
+        model_X.init();
+        model_Y.init();
+        model_Z.init();
     }
 };
 
@@ -510,7 +499,7 @@ __global__ void laszip_format2_kernel(
 
     int32_t last_Z[8] = { 0 };          // Z does NOT use a median filter!
     uint16_t last_Intensity[16] = { 0 };
-
+    
     for (int i = 1; i < points_per_chunk; i++) {
         PointFormat2 p = prev; // Start delta off previous
 
@@ -531,47 +520,42 @@ __global__ void laszip_format2_kernel(
 
         if (changed & (1 << 4)) {
             int ctx_int = (m < 3) ? m : 3;
-            int32_t dInt = state.model_intensity[ctx_int].decode(dec);
+            int32_t dInt = state.model_intensity.decode(dec, ctx_int);
             p.Intensity = (uint16_t)(last_Intensity[m] + dInt);
         }
         else {
             p.Intensity = last_Intensity[m];
         }
         last_Intensity[m] = p.Intensity;
+
         if (changed & (1 << 3)) p.Classification = state.model_classification[prev.Classification].decode(dec);
         if (changed & (1 << 2)) p.ScanAngleRank = U8_FOLD(p.ScanAngleRank + state.model_scan_angle[(p.ReturnMask >> 6) & 1].decode(dec));
         if (changed & (1 << 1)) p.UserData = state.model_user_data[prev.UserData].decode(dec);
-        if (changed & (1 << 0)) p.PointSourceID = prev.PointSourceID + state.model_point_source.decode(dec);
+        if (changed & (1 << 0)) p.PointSourceID = prev.PointSourceID + state.model_point_source.decode(dec, 0);
 
         // 3. Decode Coordinates
         int k_x, k_y, k_z;
 
         // X Coordinate
         int ctx_x = (n == 1) ? 1 : 0;
-        int32_t dx = state.model_X[ctx_x].decode(dec, k_x);
-
+        int32_t dx = state.model_X.decode(dec, ctx_x, k_x);
         int32_t dxMedian = median_X[m].get() + dx;
         p.X = ISum32(prev.X, dxMedian);
         median_X[m].add(dxMedian);
-
         // Y Coordinate
         int ctx_y = (k_x < 20) ? (k_x & ~1) : 20;
         if (n == 1) ctx_y += 1;
-        int32_t dy = state.model_Y[ctx_y].decode(dec, k_y);
+        int32_t dy = state.model_Y.decode(dec, ctx_y, k_y);
         int32_t dyMedian = median_Y[m].get() + dy;
         p.Y = ISum32(prev.Y, dyMedian);
         median_Y[m].add(dyMedian);
-
-        // Z Coordinate (NO MEDIAN)
+        // Z Coordinate 
         int kXY = (k_x + k_y) / 2;
         int ctx_z = (kXY < 18) ? (kXY & ~1) : 18;
-
-        
         if (n == 1) ctx_z += 1;
+        int32_t dz = state.model_Z.decode(dec, ctx_z, k_z);
 
-        if (chunk_id == 0 && threadIdx.x == 0 && i < 23)
-            printf("point %u: ctx_z: %i, kXY: %i \n", i, ctx_z, kXY);
-        int32_t dz = state.model_Z[ctx_z].decode(dec, k_z);
+    
         p.Z = last_Z[I] + dz;
         last_Z[I] = p.Z;
 
@@ -666,6 +650,7 @@ __global__ void laszip_format2_kernel(
         }
         out_points[base_idx + i] = p;
         prev = p;
+
     }
 }
 
