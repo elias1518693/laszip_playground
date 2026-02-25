@@ -46,40 +46,32 @@ struct ArithmeticDecoder {
     const uint8_t* buffer;
     uint32_t pos;
 
-    __device__ void init(const uint8_t* data, uint32_t offset) {
+    __device__ __forceinline__ void init(const uint8_t* data, uint32_t offset) {
         buffer = data;
         pos = offset;
         length = 0xFFFFFFFFU;
-        value = ((uint32_t)buffer[pos] << 24) | ((uint32_t)buffer[pos + 1] << 16) |
-            ((uint32_t)buffer[pos + 2] << 8) | ((uint32_t)buffer[pos + 3]);
+        value = (uint32_t)buffer[pos] << 24 | (uint32_t)buffer[pos + 1] << 16 |
+            (uint32_t)buffer[pos + 2] << 8 | (uint32_t)buffer[pos + 3];
         pos += 4;
     }
 
-    __device__ inline void renorm() {
+    __device__ __forceinline__ void renorm() {
         while (length < AC__MinLength) {
             value = (value << 8) | buffer[pos++];
             length <<= 8;
         }
     }
 
-    __device__ inline uint32_t readBits(int bit_count) {
-        // LAZ allows max 19 bits per block to prevent overflow.
-        // If more than 19 bits are needed, read the lower 16 bits first.
+    __device__ __forceinline__ uint32_t readBits(int bit_count) {
         if (bit_count > 19) {
             uint32_t lower = readBits(16);
-            uint32_t upper = readBits(bit_count - 16);
-            return lower | (upper << 16);
+            return lower | (readBits(bit_count - 16) << 16);
         }
-
-        // Read block of bits using division as exactly defined in the LAZ Raw Encoder
         uint32_t ltmp = length >> bit_count;
         uint32_t raw = value / ltmp;
-
         length = ltmp;
         value -= length * raw;
-
         renorm();
-
         return raw;
     }
 };
@@ -474,9 +466,14 @@ __global__ void laszip_format2_kernel(
 {
     int chunk_id = blockIdx.x;
 	if (threadIdx.x > 0) return;
-    if (chunk_id >= total_chunks) return;
+    if (chunk_id >= total_chunks-1) return;
+    int tid = threadIdx.x;
 
-    ChunkState state;
+    // Shared flag to signal workers
+    __shared__ int signal_update;
+    if (tid == 0) signal_update = -1;
+    __syncthreads();
+    ChunkState& state = states[chunk_id];
     state.init();
 
     int base_idx = chunk_id * points_per_chunk;
@@ -520,9 +517,7 @@ __global__ void laszip_format2_kernel(
 
         // 1. Decode Changed Values (Point10)
         uint32_t changed = state.model_changed_values.decode(dec);
-        if (chunk_id == 0 && threadIdx.x == 0 && i < 23) {
-            //printf("Point %u has dx: %i\n", i, changed);
-        }
+
         // 2. Decode Point10 attributes
         if (changed & (1 << 5)) {
             // Bit-Byte Decode

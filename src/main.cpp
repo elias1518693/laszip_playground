@@ -408,7 +408,7 @@ int main()
     // 2. Launch the CUDA wrapper
     std::vector<PointFormat2> decoded_points;
     decompress(raw_file_data, num_chunks, chunk_offsets, actual_total_points, decoded_points);
-    
+    /*
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
     laszip_point* laz_point = nullptr;
@@ -545,7 +545,7 @@ int main()
             std::println(stderr, "Warning: Error reading point {}. Stopping.", i);
             break;
         }
-        /*
+        
         std::cout << "Point " << i << ": "
             << "X=" << laz_point->X << ", "
             << "Y=" << laz_point->Y << ", "
@@ -554,7 +554,7 @@ int main()
             << "Class=" << (int)laz_point->classification << " | "
             << "RGB=(" << laz_point->rgb[0] << "," << laz_point->rgb[1] << "," << laz_point->rgb[2] << ")\n";
             
-            */
+            
         int32_t X = laz_point->X;
         int32_t Y = laz_point->Y;
         int32_t Z = laz_point->Z;
@@ -662,6 +662,6 @@ int main()
     if (laszip_reader) {
         laszip_destroy(laszip_reader);
     }
-
+    */
    
 }
