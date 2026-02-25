@@ -88,7 +88,7 @@ struct ArithmeticDecoder {
 // 2. Symbol Model (FastAC)
 // ---------------------------------------------------------------
 struct SymbolModel {
-    uint32_t symbol_count[256];
+    uint16_t symbol_count[256];
     uint16_t distribution[256];
     uint32_t update_cycle;
     uint32_t symbols_until_update;
@@ -128,16 +128,26 @@ struct SymbolModel {
         symbols_until_update = update_cycle;
     }
 
-    __device__ uint32_t decode(ArithmeticDecoder& dec) {
+    __device__ __forceinline__ uint32_t decode(ArithmeticDecoder& dec) {
         uint32_t ltmp = dec.length >> 15;
-        uint32_t sym = 0;
-        for (int s = num_symbols - 1; s >= 0; s--) {
-            if ((uint32_t)distribution[s] * ltmp <= dec.value) { sym = s; break; }
+
+        // Binary search on distribution[0..num_symbols-1]
+        int lo = 0, hi = (int)num_symbols - 1, sym = 0;
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            uint32_t lower_mid = (uint32_t)distribution[mid] * ltmp;
+            if (lower_mid <= dec.value) {
+                sym = mid;         // mid is a feasible lower bound
+                lo = mid + 1;
+            }
+            else {
+                hi = mid - 1;
+            }
         }
+
         uint32_t lower = (uint32_t)distribution[sym] * ltmp;
         dec.value -= lower;
-
-        if (sym < num_symbols - 1) {
+        if ((uint32_t)sym < num_symbols - 1) {
             dec.length = ((uint32_t)distribution[sym + 1] * ltmp) - lower;
         }
         else {
@@ -145,7 +155,7 @@ struct SymbolModel {
         }
         dec.renorm();
 
-        symbol_count[sym]++;
+        symbol_count[sym]++;                      // adapt as before
         if (--symbols_until_update == 0) update_distribution();
         return sym;
     }
@@ -466,7 +476,7 @@ __global__ void laszip_format2_kernel(
 	if (threadIdx.x > 0) return;
     if (chunk_id >= total_chunks) return;
 
-    ChunkState& state = states[chunk_id];
+    ChunkState state;
     state.init();
 
     int base_idx = chunk_id * points_per_chunk;
