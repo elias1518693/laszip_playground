@@ -324,7 +324,64 @@ int load_laz_for_gpu(const std::string& filename,
 
     return 0;
 }
+#include <iostream>
+#include <cmath>
 
+template <typename LazPoint>
+bool comparePoints(const LazPoint* laz_point, const PointFormat2& p, int index) {
+    bool is_match = true;
+
+    // 1. Check Coordinates
+    if (laz_point->X != p.X) is_match = false;
+    if (laz_point->Y != p.Y) is_match = false;
+    if (laz_point->Z != p.Z) is_match = false;
+
+    // 2. Check Attributes
+    if (laz_point->intensity != p.Intensity) is_match = false;
+    if (laz_point->classification != p.Classification) is_match = false;
+
+    // 3. Check RGB 
+    if (laz_point->rgb[0] != p.Red) is_match = false;
+    if (laz_point->rgb[1] != p.Green) is_match = false;
+    if (laz_point->rgb[2] != p.Blue) is_match = false;
+
+    // 4. If anything didn't match, print the ENTIRE point for both, then list the errors.
+    if (!is_match) {
+        std::cerr << "\n========== MISMATCH AT POINT " << index << " ==========\n";
+
+        // Print Full LAZ Point
+        std::cerr << "[LAZ Data] "
+            << "X=" << laz_point->X << ", "
+            << "Y=" << laz_point->Y << ", "
+            << "Z=" << laz_point->Z << " | "
+            << "Int=" << laz_point->intensity << " | "
+            << "Class=" << (int)laz_point->classification << " | "
+            << "RGB=(" << laz_point->rgb[0] << "," << laz_point->rgb[1] << "," << laz_point->rgb[2] << ")\n";
+
+        // Print Full GPU Point
+        std::cerr << "[GPU Data] "
+            << "X=" << p.X << ", "
+            << "Y=" << p.Y << ", "
+            << "Z=" << p.Z << " | "
+            << "Int=" << p.Intensity << " | "
+            << "Class=" << (int)p.Classification << " | "
+            << "RGB=(" << p.Red << "," << p.Green << "," << p.Blue << ")\n";
+
+        std::cerr << "--- Specific Differences ---\n";
+        if (laz_point->X != p.X) std::cerr << " -> X differs: LAZ=" << laz_point->X << " vs GPU=" << p.X << "\n";
+        if (laz_point->Y != p.Y) std::cerr << " -> Y differs: LAZ=" << laz_point->Y << " vs GPU=" << p.Y << "\n";
+        if (laz_point->Z != p.Z) std::cerr << " -> Z differs: LAZ=" << laz_point->Z << " vs GPU=" << p.Z << "\n";
+        if (laz_point->intensity != p.Intensity) std::cerr << " -> Intensity differs: LAZ=" << laz_point->intensity << " vs GPU=" << p.Intensity << "\n";
+        if (laz_point->classification != p.Classification) std::cerr << " -> Class differs: LAZ=" << (int)laz_point->classification << " vs GPU=" << (int)p.Classification << "\n";
+        if (laz_point->rgb[0] != p.Red) std::cerr << " -> Red differs: LAZ=" << laz_point->rgb[0] << " vs GPU=" << p.Red << "\n";
+        if (laz_point->rgb[1] != p.Green) std::cerr << " -> Green differs: LAZ=" << laz_point->rgb[1] << " vs GPU=" << p.Green << "\n";
+        if (laz_point->rgb[2] != p.Blue) std::cerr << " -> Blue differs: LAZ=" << laz_point->rgb[2] << " vs GPU=" << p.Blue << "\n";
+
+        std::cerr << "============================================\n";
+    }
+
+    return is_match;
+}
 
 
 /**
@@ -334,7 +391,7 @@ int load_laz_for_gpu(const std::string& filename,
 
 int main()
 {
-    string file = "./resources/pointclouds/test.laz";
+    string file = "./resources/pointclouds/large2.laz";
     std::vector<uint8_t> raw_file_data;
     uint32_t num_chunks = 0;
     std::vector<uint64_t> chunk_offsets;
@@ -349,7 +406,8 @@ int main()
     std::cout << "Found " << num_chunks << " chunks.\n";
    
     // 2. Launch the CUDA wrapper
-    decompress(raw_file_data, num_chunks, chunk_offsets, actual_total_points);
+    std::vector<PointFormat2> decoded_points;
+    decompress(raw_file_data, num_chunks, chunk_offsets, actual_total_points, decoded_points);
     /*
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
@@ -487,7 +545,7 @@ int main()
             std::println(stderr, "Warning: Error reading point {}. Stopping.", i);
             break;
         }
-        if(i < 10)
+        
         std::cout << "Point " << i << ": "
             << "X=" << laz_point->X << ", "
             << "Y=" << laz_point->Y << ", "
@@ -495,11 +553,25 @@ int main()
             << "Int=" << laz_point->intensity << " | "
             << "Class=" << (int)laz_point->classification << " | "
             << "RGB=(" << laz_point->rgb[0] << "," << laz_point->rgb[1] << "," << laz_point->rgb[2] << ")\n";
+            
+
         int32_t X = laz_point->X;
         int32_t Y = laz_point->Y;
         int32_t Z = laz_point->Z;
+        
 
+       
+            // Assuming you have a way to access the i-th LAZ point here. 
+            // For example: lasreader->read_point(); auto laz_point = lasreader->point;
 
+            const auto& p = decoded_points[i];
+
+            if (!comparePoints(laz_point, p, i)) {
+                std::cout << "Found missmatch at " << i << ".\n";
+                // Optional: break early if you only care about the first failure
+                break; 
+            }
+        
 
         // Bounds check
         if (l >= MAX_RETURNS || m >= MAX_RETURN_MAPS) {
@@ -590,5 +662,6 @@ int main()
     if (laszip_reader) {
         laszip_destroy(laszip_reader);
     }
-    */
+
+   */
 }

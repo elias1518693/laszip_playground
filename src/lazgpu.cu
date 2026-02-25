@@ -98,6 +98,7 @@ struct SymbolModel {
         num_symbols = symbols;
         for (uint32_t i = 0; i < num_symbols; i++) symbol_count[i] = 1;
 
+        update_cycle = num_symbols; // Add this line
         update_distribution();
 
         update_cycle = (num_symbols + 6) / 2;
@@ -111,7 +112,7 @@ struct SymbolModel {
         if (total_count > 32768) {
             total_count = 0;
             for (uint32_t i = 0; i < num_symbols; i++) {
-                symbol_count[i] = (symbol_count[i] >> 1) + 1;
+                symbol_count[i] = (symbol_count[i] + 1) >> 1;
                 total_count += symbol_count[i];
             }
         }
@@ -174,8 +175,10 @@ struct BitModel {
             bit_0_count = (bit_0_count + 1) >> 1;
             if (bit_0_count == bit_count) bit_count++;
         }
-        // Bit probability scaled to 13 bits (8192)
-        bit_0_prob = (bit_0_count * 8192) / bit_count;
+
+        // Exactly mirror the C++ precision loss
+        uint32_t scale = 0x80000000U / bit_count;
+        bit_0_prob = (bit_0_count * scale) >> 18;
 
         update_cycle += (update_cycle >> 2);
         if (update_cycle > 64) update_cycle = 64;
@@ -456,9 +459,11 @@ __global__ void laszip_format2_kernel(
     PointFormat2* __restrict__ out_points,
     int points_per_chunk,
     int total_chunks,
+	uint64_t total_points,
     ChunkState* states)
 {
-    int chunk_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int chunk_id = blockIdx.x;
+	if (threadIdx.x > 0) return;
     if (chunk_id >= total_chunks) return;
 
     ChunkState& state = states[chunk_id];
@@ -500,7 +505,7 @@ __global__ void laszip_format2_kernel(
     int32_t last_Z[8] = { 0 };          // Z does NOT use a median filter!
     uint16_t last_Intensity[16] = { 0 };
     
-    for (int i = 1; i < points_per_chunk; i++) {
+    for (int i = 1; i < points_per_chunk && i < total_points; i++) {
         PointFormat2 p = prev; // Start delta off previous
 
         // 1. Decode Changed Values (Point10)
@@ -659,9 +664,10 @@ __global__ void laszip_format2_kernel(
 int decompress(const std::vector<uint8_t>& raw_file_data,
     uint32_t num_chunks,
     const std::vector<uint64_t>& chunk_offsets,
-    uint64_t actual_total_points)
+    uint64_t actual_total_points,
+    std::vector<PointFormat2>& points)
 {
-    int points_per_chunk = 5000;
+    int points_per_chunk = 50000;
     uint64_t total_points = actual_total_points;
     size_t raw_byte_size = raw_file_data.size();
 
@@ -685,7 +691,7 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
     gpuErrchk(cudaMemcpy(d_chunk_offsets, chunk_offsets.data(), num_chunks * sizeof(uint64_t), cudaMemcpyHostToDevice));
 
     // Kernel Configuration
-    int threads_per_block = 32;
+    int threads_per_block = 1;
     int blocks = (num_chunks + threads_per_block - 1) / threads_per_block;
     cudaEvent_t start, stop;
     cudaEventCreate(&start); cudaEventCreate(&stop);
@@ -693,9 +699,9 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
     // Launch Kernel
     std::cout << "Launching Kernel: " << blocks << " blocks, "
         << threads_per_block << " threads/block..." << std::endl;
-    laszip_format2_kernel << <blocks, threads_per_block >> > (
+    laszip_format2_kernel << <num_chunks, 32 >> > (
         d_compressed, d_chunk_offsets, d_out_points,
-        points_per_chunk, num_chunks, d_states
+        points_per_chunk, num_chunks, total_points, d_states
         );
     std::cout << "Kernel execution complete.\n";
     // 1st Check: Catch synchronous errors (e.g., invalid grid/block dimensions)
@@ -709,13 +715,13 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
     cudaEventElapsedTime(&ms, start, stop);
     // Copy Results Back
     {
-        std::vector<PointFormat2> h_points(total_points);
-        gpuErrchk(cudaMemcpy(h_points.data(), d_out_points, total_points * sizeof(PointFormat2), cudaMemcpyDeviceToHost));
+        points = std::vector<PointFormat2>(total_points);
+        gpuErrchk(cudaMemcpy(points.data(), d_out_points, total_points * sizeof(PointFormat2), cudaMemcpyDeviceToHost));
 
-        int num_to_print = std::min(30, (int)h_points.size());
+        int num_to_print = std::min(0, (int)points.size());
         std::cout << "\n--- First " << num_to_print << " Points ---\n";
         for (int i = 0; i < num_to_print; i++) {
-            const auto& p = h_points[i];
+            const auto& p = points[i];
 
             // Note: We cast uint8_t and int8_t to (int) so std::cout prints 
             // numbers instead of ASCII characters.
