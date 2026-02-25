@@ -97,27 +97,94 @@ struct SymbolModel {
         symbols_until_update = update_cycle;
     }
 
+    __device__ __forceinline__ uint32_t warp_reduce_sum(uint32_t v) {
+        // Full-warp reduction
+        const unsigned mask = 0xffffffffu;
+        v += __shfl_down_sync(mask, v, 16);
+        v += __shfl_down_sync(mask, v, 8);
+        v += __shfl_down_sync(mask, v, 4);
+        v += __shfl_down_sync(mask, v, 2);
+        v += __shfl_down_sync(mask, v, 1);
+        return v; // total is now in lane 0
+    }
+
+    __device__ __forceinline__ uint32_t warp_exclusive_scan(uint32_t v) {
+        // Full-warp exclusive scan (sum of lanes < me)
+        const unsigned mask = 0xffffffffu;
+        uint32_t res = v;
+        uint32_t tmp;
+
+        tmp = __shfl_up_sync(mask, res, 1);  if ((threadIdx.x & 31) >= 1)  res += tmp;
+        tmp = __shfl_up_sync(mask, res, 2);  if ((threadIdx.x & 31) >= 2)  res += tmp;
+        tmp = __shfl_up_sync(mask, res, 4);  if ((threadIdx.x & 31) >= 4)  res += tmp;
+        tmp = __shfl_up_sync(mask, res, 8);  if ((threadIdx.x & 31) >= 8)  res += tmp;
+        tmp = __shfl_up_sync(mask, res, 16); if ((threadIdx.x & 31) >= 16) res += tmp;
+
+        return res - v; // convert inclusive to exclusive
+    }
+
     __device__ void update_distribution() {
-        uint32_t total_count = 0;
-        for (uint32_t i = 0; i < num_symbols; i++) total_count += symbol_count[i];
+        const unsigned mask = 0xffffffffu;
+        const int lane = threadIdx.x & 31;
 
-        if (total_count > 32768) {
-            total_count = 0;
-            for (uint32_t i = 0; i < num_symbols; i++) {
-                symbol_count[i] = (symbol_count[i] + 1) >> 1;
-                total_count += symbol_count[i];
+        // 1) total_count = sum(symbol_count)
+        uint32_t local_sum = 0;
+        for (uint32_t i = lane; i < num_symbols; i += 32) {
+            local_sum += symbol_count[i];
+        }
+        uint32_t total_count = warp_reduce_sum(local_sum);
+        total_count = __shfl_sync(mask, total_count, 0);
+
+        if (total_count > 32768u) {
+            uint32_t local_sum2 = 0;
+            for (uint32_t i = lane; i < num_symbols; i += 32) {
+                uint32_t v = symbol_count[i];
+                v = (v + 1u) >> 1; // round-up halving
+                symbol_count[i] = v;
+                local_sum2 += v;
             }
+            total_count = warp_reduce_sum(local_sum2);
+            total_count = __shfl_sync(mask, total_count, 0);
         }
 
-        uint32_t sum = 0;
-        uint32_t scale = 0x80000000U / total_count;
-        for (uint32_t i = 0; i < num_symbols; i++) {
-            distribution[i] = (uint16_t)((scale * sum) >> 16);
-            sum += symbol_count[i];
+        // 3) scale = 0x80000000U / total_count
+        uint32_t scale = 0x80000000u / total_count;
+        scale = __shfl_sync(mask, scale, 0);
+
+        // 4) Compute distribution via exclusive prefix sum over symbol_count
+        //    Do it in tiles of 32 with a running offset.
+        uint32_t offset = 0;
+
+        for (uint32_t base = 0; base < num_symbols; base += 32) {
+            uint32_t idx = base + lane;
+            uint32_t val = (idx < num_symbols) ? symbol_count[idx] : 0u;
+
+            // Exclusive scan within warp
+            uint32_t excl = warp_exclusive_scan(val);
+
+            // prefix (sum of all previous elements before idx)
+            uint32_t prefix = offset + excl;
+
+            // Write distribution for valid indices
+            if (idx < num_symbols) {
+                // Match original: (scale * sum) >> 16; 32-bit safe since scale ~= 2^31/total, prefix <= total
+                uint32_t mapped = (uint32_t)(((uint64_t)scale * (uint64_t)prefix) >> 16);
+                distribution[idx] = (uint16_t)mapped;
+            }
+
+            // Advance offset by tile sum (sum of this tile's vals)
+            uint32_t tile_sum = warp_reduce_sum(val);
+            tile_sum = __shfl_sync(mask, tile_sum, 0);
+            offset += tile_sum;
         }
-        update_cycle += (update_cycle >> 2);
-        if (update_cycle > 8 * (num_symbols + 6)) update_cycle = 8 * (num_symbols + 6);
-        symbols_until_update = update_cycle;
+
+        // 5) Scalar updates (do once)
+        if (lane == 0) {
+            update_cycle += (update_cycle >> 2);
+            uint32_t cap = 8u * (num_symbols + 6u);
+            if (update_cycle > cap) update_cycle = cap;
+            symbols_until_update = update_cycle;
+        }
     }
 
     __device__ __forceinline__ uint32_t decode(ArithmeticDecoder& dec) {
@@ -455,6 +522,14 @@ __device__ inline int clamp255(int v) {
     return v;
 }
 #define U8_FOLD(v) ((uint8_t)((v) & 0xFF))
+
+__global__ void laszip_init_state_kernel(ChunkState* states, int total_chunks) {
+    int chunk_id = blockIdx.x;
+    if (chunk_id >= total_chunks - 1) return;
+    ChunkState& state = states[chunk_id];
+	state.init();
+}
+
 __global__ void laszip_format2_kernel(
     const uint8_t* __restrict__ compressed,
     const uint64_t* __restrict__ chunk_offsets,
@@ -465,16 +540,9 @@ __global__ void laszip_format2_kernel(
     ChunkState* states)
 {
     int chunk_id = blockIdx.x;
-	if (threadIdx.x > 0) return;
     if (chunk_id >= total_chunks-1) return;
-    int tid = threadIdx.x;
-
-    // Shared flag to signal workers
-    __shared__ int signal_update;
-    if (tid == 0) signal_update = -1;
-    __syncthreads();
     ChunkState& state = states[chunk_id];
-    state.init();
+   
 
     int base_idx = chunk_id * points_per_chunk;
     uint64_t offset = chunk_offsets[chunk_id];
@@ -696,15 +764,20 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
     gpuErrchk(cudaMemcpy(d_chunk_offsets, chunk_offsets.data(), num_chunks * sizeof(uint64_t), cudaMemcpyHostToDevice));
 
     // Kernel Configuration
-    int threads_per_block = 1;
+    int threads_per_block = 32;
     int blocks = (num_chunks + threads_per_block - 1) / threads_per_block;
+	laszip_init_state_kernel << <num_chunks, 32 >> > (d_states, num_chunks);
+    gpuErrchk(cudaGetLastError());
+
+    // 2nd Check: Catch asynchronous errors (e.g., memory out-of-bounds inside the kernel)
+    gpuErrchk(cudaDeviceSynchronize());
     cudaEvent_t start, stop;
     cudaEventCreate(&start); cudaEventCreate(&stop);
     cudaEventRecord(start);
     // Launch Kernel
     std::cout << "Launching Kernel: " << blocks << " blocks, "
         << threads_per_block << " threads/block..." << std::endl;
-    laszip_format2_kernel << <num_chunks, 32 >> > (
+    laszip_format2_kernel << <num_chunks, 64 >> > (
         d_compressed, d_chunk_offsets, d_out_points,
         points_per_chunk, num_chunks, total_points, d_states
         );

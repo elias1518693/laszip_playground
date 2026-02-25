@@ -404,11 +404,11 @@ int main()
 
     std::cout << "Successfully loaded " << raw_file_data.size() << " bytes.\n";
     std::cout << "Found " << num_chunks << " chunks.\n";
-   
+
     // 2. Launch the CUDA wrapper
     std::vector<PointFormat2> decoded_points;
     decompress(raw_file_data, num_chunks, chunk_offsets, actual_total_points, decoded_points);
-    /*
+    if (false) {
     laszip_POINTER laszip_reader = nullptr;
     laszip_header* lazHeader = nullptr;
     laszip_point* laz_point = nullptr;
@@ -418,7 +418,7 @@ int main()
         std::println(stderr, "Failed to create laszip reader.");
         return 1;
     }
-    
+
     laszip_BOOL is_compressed;
     laszip_BOOL request_reader = true;
 
@@ -433,7 +433,7 @@ int main()
     laszip_U8 version_minor;
     laszip_U16 revision;
     laszip_U32 build;
-	laszip_get_version(&version_major, &version_minor, &revision, &build);
+    laszip_get_version(&version_major, &version_minor, &revision, &build);
     laszip_get_header_pointer(laszip_reader, &lazHeader);
     if (!lazHeader) {
         std::println(stderr, "Failed to get LAS header.");
@@ -545,7 +545,7 @@ int main()
             std::println(stderr, "Warning: Error reading point {}. Stopping.", i);
             break;
         }
-        
+        /*
         std::cout << "Point " << i << ": "
             << "X=" << laz_point->X << ", "
             << "Y=" << laz_point->Y << ", "
@@ -553,25 +553,25 @@ int main()
             << "Int=" << laz_point->intensity << " | "
             << "Class=" << (int)laz_point->classification << " | "
             << "RGB=(" << laz_point->rgb[0] << "," << laz_point->rgb[1] << "," << laz_point->rgb[2] << ")\n";
-            
-            
+
+            */
         int32_t X = laz_point->X;
         int32_t Y = laz_point->Y;
         int32_t Z = laz_point->Z;
-        
 
-       
-            // Assuming you have a way to access the i-th LAZ point here. 
-            // For example: lasreader->read_point(); auto laz_point = lasreader->point;
 
-            const auto& p = decoded_points[i];
 
-            if (!comparePoints(laz_point, p, i)) {
-                std::cout << "Found missmatch at " << i << ".\n";
-                // Optional: break early if you only care about the first failure
-                break; 
-            }
-        
+        // Assuming you have a way to access the i-th LAZ point here. 
+        // For example: lasreader->read_point(); auto laz_point = lasreader->point;
+
+        const auto& p = decoded_points[i];
+
+        if (!comparePoints(laz_point, p, i)) {
+            std::cout << "Found missmatch at " << i << ".\n";
+            // Optional: break early if you only care about the first failure
+            break;
+        }
+
 
         // Bounds check
         if (l >= MAX_RETURNS || m >= MAX_RETURN_MAPS) {
@@ -662,6 +662,6 @@ int main()
     if (laszip_reader) {
         laszip_destroy(laszip_reader);
     }
-    */
+}
    
 }
