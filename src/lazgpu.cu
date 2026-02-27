@@ -777,7 +777,7 @@ int decompress(const std::vector<uint8_t>& raw_file_data,
     // Launch Kernel
     std::cout << "Launching Kernel: " << blocks << " blocks, "
         << threads_per_block << " threads/block..." << std::endl;
-    laszip_format2_kernel << <num_chunks, 64 >> > (
+    laszip_format2_kernel << <num_chunks, 32 >> > (
         d_compressed, d_chunk_offsets, d_out_points,
         points_per_chunk, num_chunks, total_points, d_states
         );
